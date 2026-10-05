@@ -616,7 +616,7 @@ InLobbyMenu::InLobbyMenu(LobbyMenu *menu, SokuLib::MenuConnect *parent, std::sha
 	this->_connection->onPlayerLeave = [this](const Player &r){
 		{
 			std::lock_guard<std::mutex> lock(this->_recentOpponentMutex);
-			if (this->_recentOpponent && this->_recentOpponent->playerId == r.id) {
+			if (this->_recentOpponent && this->_recentOpponent->playerName == r.name) {
 				this->_recentOpponent->matchActive = false;
 				this->_recentOpponent->expiresAt = std::chrono::steady_clock::now() + std::chrono::minutes(5);
 			}
@@ -734,6 +734,17 @@ InLobbyMenu::InLobbyMenu(LobbyMenu *menu, SokuLib::MenuConnect *parent, std::sha
 		bool opponentDisconnected = false;
 		bool opponentJoined = false;
 		bool opponentMessage = false;
+		// IDs can be reused after a disconnect. Resolve the current sender
+		// from the connection, not the cached opponent ID or UI player copy.
+		std::string senderName;
+		if (player != 0) {
+			const auto players = this->_connection->getPlayers();
+			auto sender = std::find_if(players.begin(), players.end(), [player](const Player &p) {
+				return p.id == player;
+			});
+			if (sender != players.end())
+				senderName = sender->name;
+		}
 		if (privateMessage)
 			colorOverride = opponentChatColor;
 		{
@@ -741,7 +752,7 @@ InLobbyMenu::InLobbyMenu(LobbyMenu *menu, SokuLib::MenuConnect *parent, std::sha
 			if (this->_recentOpponent) {
 				auto now = std::chrono::steady_clock::now();
 				bool highlighted = this->_recentOpponent->matchActive || now < this->_recentOpponent->expiresAt;
-				if (highlighted && player == this->_recentOpponent->playerId) {
+				if (highlighted && !senderName.empty() && senderName == this->_recentOpponent->playerName) {
 					colorOverride = opponentChatColor;
 					opponentMessage = true;
 				}
@@ -2543,7 +2554,7 @@ void InLobbyMenu::_updateRecentOpponent()
 		}
 
 		auto opponent = std::find_if(players.begin(), players.end(), [this](const Player &p){
-			return p.id == this->_recentOpponent->playerId;
+			return p.name == this->_recentOpponent->playerName;
 		});
 		if (
 			me->battleStatus != Lobbies::BATTLE_STATUS_PLAYING ||
