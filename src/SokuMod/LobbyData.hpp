@@ -16,6 +16,7 @@
 #include <SokuLib.hpp>
 #include <curl/curl.h>
 #include "nlohmann/json.hpp"
+#include "RelativeRatings.hpp"
 
 #define EMOTE_SIZE 32
 #define CHR_STATS_MAGIC 0xF2A6E790
@@ -56,6 +57,7 @@ private:
 	static size_t LobbyData::writeMemoryCallback(void *contents, size_t size, size_t nmemb, void *userp);
 
 	std::map<unsigned, SokuLib::SWRFont> _fonts;
+	std::unique_ptr<RelativeRatings> _relativeRatings;
 	unsigned _achTimer = 0;
 	unsigned _animCtr = 0;
 	unsigned _anim = 0;
@@ -268,6 +270,7 @@ public:
 	void saveStats();
 	void update();
 	void render();
+	RelativeRatings &relativeRatings() { return *_relativeRatings; }
 };
 
 extern std::unique_ptr<LobbyData> lobbyData;

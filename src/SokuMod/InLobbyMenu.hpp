@@ -26,6 +26,10 @@ private:
 	struct PlayerData {
 		SokuLib::DrawUtils::Sprite name;
 	};
+	struct RelativeRatingCard {
+		std::string content;
+		std::vector<SokuLib::DrawUtils::Sprite> lines;
+	};
 	struct MessageText {
 		SokuLib::DrawUtils::Sprite sprite;
 		SokuLib::Vector2i realSize;
@@ -167,6 +171,17 @@ private:
 		std::chrono::steady_clock::time_point receivedAt;
 	};
 	std::map<uint32_t, PlayerData> _extraPlayerData;
+	std::map<uint32_t, RelativeRatingCard> _relativeRatingCards;
+	uint32_t _relativeRatingTarget = UINT32_MAX;
+	uint32_t _relativeRatingCandidate = UINT32_MAX;
+	std::chrono::steady_clock::time_point _relativeRatingCandidateSince{};
+	bool _relativeRatingF8Override = false;
+	bool _relativeRatingPositionInitialized = false;
+	SokuLib::Vector2u _relativeRatingLastPosition{};
+	bool _relativeRatingF8WasDown = false;
+	bool _relativeRatingF10WasDown = false;
+	int _relativeRatingHotkeyMode = -1;
+	unsigned _relativeRatingLastConfiguredMode = UINT32_MAX;
 	std::map<uint32_t, std::string> _pendingPlayerNames;
 	std::queue<uint32_t> _pendingPlayerNameOrder;
 	std::map<uint32_t, PendingTextBubble> _pendingTextBubbles;
@@ -321,6 +336,8 @@ private:
 	std::optional<std::string> _getBlacklistedBattlePlayer(unsigned machineId) const;
 	void _unhook();
 	void _renderMachineOverlay();
+	void _updateRelativeRatingTarget();
+	void _renderRelativeRatings();
 	void _startHosting();
 	void _updateCompositionSprite();
 	void _openMessageBox(int sound, const std::string &text, const std::string &title, UINT type);

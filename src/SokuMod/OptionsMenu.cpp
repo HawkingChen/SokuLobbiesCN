@@ -4,6 +4,7 @@
 #include <cmath>
 #include <cstdio>
 #include <filesystem>
+#include <fstream>
 #include <map>
 #include <shellapi.h>
 #include <../directx/dinput.h>
@@ -142,7 +143,8 @@ std::wstring localizedOptionName(const std::string &name)
 	static const std::map<std::string, std::wstring> labels = {
 		{"Language", L"\u8BED\u8A00"}, {"Chat Popup Mode", L"\u804A\u5929\u5F39\u51FA\u6A21\u5F0F"}, {"Text Bubbles", L"\u804A\u5929\u6C14\u6CE1"},
 		{"Max Chat Messages", L"\u6700\u5927\u804A\u5929\u8BB0\u5F55"}, {"Chat Key", L"\u804A\u5929\u6846\u6309\u952E"}, {"Opponent Chat Color", L"\u5BF9\u624B\u804A\u5929\u989C\u8272"},
-		{"Host IP", L"\u5BF9\u6218 IP"}, {"Chat Logs", L"\u804A\u5929\u65E5\u5FD7"}, {"Reset Config", L"\u91CD\u7F6E\u914D\u7F6E"}, {"Quick Messages", L"\u5FEB\u6377\u5BF9\u8BDD"}
+		{"Host IP", L"\u5BF9\u6218 IP"}, {"Chat Logs", L"\u804A\u5929\u65E5\u5FD7"}, {"Reset Config", L"\u91CD\u7F6E\u914D\u7F6E"}, {"Quick Messages", L"\u5FEB\u6377\u5BF9\u8BDD"},
+		{"Rating Settings", L"\u7B49\u7EA7\u5206\u8BBE\u7F6E"}
 	};
 	auto found = labels.find(name);
 	return found == labels.end() ? std::wstring(name.begin(), name.end()) : found->second;
@@ -157,6 +159,8 @@ std::wstring localizedChoice(const std::string &label)
 		{"Off", L"\u5173\u95ED"}, {"On", L"\u5F00\u542F"}, {"Soft Blue", L"\u67D4\u548C\u84DD"}, {"Gold", L"\u91D1\u8272"}, {"Soft Pink", L"\u67D4\u548C\u7C89"},
 		{"Soft Green", L"\u67D4\u548C\u7EFF"}, {"Orange", L"\u6A59\u8272"}, {"Purple", L"\u7D2B\u8272"}, {"White", L"\u767D\u8272"}, {"Auto", L"\u81EA\u52A8"},
 		{"Open Folder", L"\u6253\u5F00\u6587\u4EF6\u5939"}, {"Restore Defaults", L"\u6062\u590D\u9ED8\u8BA4\u914D\u7F6E"}, {"Edit 1-9", L"\u7F16\u8F91 1-9"},
+		{"Settings", L"\u8BBE\u7F6E"}, {"Automatic", L"\u81EA\u52A8"}, {"Manual (F8)", L"\u624B\u52A8 (F8)"}, {"Off", L"\u5173\u95ED"},
+		{"Above", L"\u5934\u4E0A"}, {"Center", L"\u8EAB\u4E0A"}, {"Right", L"\u53F3\u4FA7"}, {"Open Mapping", L"\u7F16\u8F91\u8D26\u53F7\u6620\u5C04"}, {"Refresh Now", L"\u7ACB\u5373\u5237\u65B0"},
 		{"Enter", L"\u56DE\u8F66"}, {"Space", L"\u7A7A\u683C"}
 	};
 	auto found = labels.find(label);
@@ -426,24 +430,42 @@ OptionsMenu::OptionsMenu(LobbyMenu *parent) :
 			playSound(0x28);
 		}
 	});
+	this->_addOption({
+		"Rating Settings",
+		{{"Settings", 0}},
+		[] { return 0u; },
+		[](unsigned) { return true; },
+		{},
+		[this] {
+			this->_editingRatings = true;
+			this->_ratingPage = 0;
+			this->_ratingCursor = 0;
+			this->_refreshRatingSettings();
+			playSound(0x28);
+		}
+	});
 	// Keep the menu layout predictable while grouping related controls.
 	std::stable_sort(this->_options.begin(), this->_options.end(), [](const Option &left, const Option &right) {
 		auto rank = [](const std::string &name) {
 			if (name == "Chat Popup Mode") return 0;
 			if (name == "Text Bubbles") return 1;
 			if (name == "Quick Messages") return 2;
-			if (name == "Opponent Chat Color") return 3;
-			if (name == "Chat Key") return 4;
-			if (name == "Host IP") return 5;
-			if (name == "Language") return 6;
-			if (name == "Max Chat Messages") return 7;
-			if (name == "Chat Logs") return 8;
-			if (name == "Reset Config") return 9;
+			if (name == "Rating Settings") return 3;
+			if (name == "Opponent Chat Color") return 4;
+			if (name == "Chat Key") return 5;
+			if (name == "Host IP") return 6;
+			if (name == "Language") return 7;
+			if (name == "Max Chat Messages") return 8;
+			if (name == "Chat Logs") return 9;
+			if (name == "Reset Config") return 10;
 			return 100;
 		};
 		return rank(left.name) < rank(right.name);
 	});
 	this->_initMessageEditor();
+	this->_ratingLabels.resize(7);
+	this->_ratingValues.resize(7);
+	this->_refreshRatingSettings();
 	this->_refreshLanguage();
 }
 
@@ -489,6 +511,8 @@ void OptionsMenu::_refreshLanguage()
 	}
 	for (unsigned i = 0; i < this->_messageValues.size(); i++)
 		this->_refreshMessageValue(i);
+	if (!this->_ratingLabels.empty())
+		this->_refreshRatingSettings();
 }
 
 void OptionsMenu::_showSaveError()
@@ -651,6 +675,134 @@ void OptionsMenu::_renderMessageEditor()
 	inputBoxRender();
 }
 
+void OptionsMenu::_refreshRatingSettings()
+{
+	if (this->_ratingLabels.size() != 7)
+		return;
+	createLocalizedSprite(this->_ratingHint, chineseLanguage
+		? L"\u65B9\u5411\u952E\uFF1A\u4FEE\u6539    B / ESC\uFF1A\u8FD4\u56DE"
+		: L"Arrows: Change    B / ESC: Back", 12, {540, 20});
+	this->_ratingHint.setPosition({62, 392});
+	const std::vector<std::wstring> descriptions = chineseLanguage ? std::vector<std::wstring>{
+			L"\u5728\u5927\u5385\u663E\u793A\u7B49\u7EA7\u5206\u5361\u7247\u3002\u6570\u636E\u5728\u540E\u53F0\u52A0\u8F7D\u5E76\u7F13\u5B58\u3002",
+			L"\u81EA\u52A8\u663E\u793A\u6700\u8FD1\u73A9\u5BB6\uFF1B\u6309 F8 \u4E34\u65F6\u5207\u6362\u4E0B\u4E00\u4F4D\u3002\n\u79FB\u52A8\u540E\u6062\u590D\u81EA\u52A8\u8DDF\u968F\u3002F10 \u4E34\u65F6\u9690\u85CF/\u6062\u590D\u5361\u7247\u3002",
+			L"\u5728\u5DE6\u4E0A\u89D2\u663E\u793A\u81EA\u5DF1\u7684\u7B49\u7EA7\u5206\u5361\u7247\u3002",
+			L"\u7EFF\u8272\u811A\u4E0B\u6807\u8BB0\uFF1A\u6BD4\u4F60\u4F4E\u81F3\u5C11 100 \u5206\u3002\n\u7EA2\u8272\u56DB\u89D2\u6807\u8BB0\uFF1A\u6BD4\u4F60\u9AD8\u81F3\u5C11 300 \u5206\u3002",
+			L"\u8C03\u6574\u9644\u8FD1\u73A9\u5BB6\u7684\u5361\u7247\u4F4D\u7F6E\uFF0C\u9760\u8FD1\u5C4F\u5E55\u8FB9\u7F18\u65F6\u81EA\u52A8\u907F\u8BA9\u3002"
+	} : std::vector<std::wstring>{
+			L"Show rating cards. Data loads and caches in the background.",
+			L"Auto shows the nearest player. F8 temporarily cycles to the next player; moving restores auto-follow.\nF10 temporarily hides/shows the card (settings unchanged).",
+			L"Show your own rating card in the top-left corner.",
+			L"Green foot marker: at least 100 points below you.\nRed corners: at least 300 points above you.",
+			L"Place nearby player cards. Cards stay inside the screen."
+	};
+	createLocalizedSprite(this->_ratingDescription, descriptions[this->_ratingCursor], 12, {518, 52});
+	this->_ratingDescription.setPosition({62, 318});
+	std::vector<std::wstring> names;
+	std::vector<std::wstring> values;
+	if (this->_ratingPage == 0) {
+		names = chineseLanguage
+			? std::vector<std::wstring>{L"\u542F\u7528\u8BC4\u5206", L"\u9644\u8FD1\u73A9\u5BB6", L"\u663E\u793A\u81EA\u5DF1\u8BC4\u5206", L"\u73A9\u5BB6\u6807\u8BB0", L"\u5361\u7247\u4F4D\u7F6E"}
+			: std::vector<std::wstring>{L"Enable Ratings", L"Nearby Player", L"Show Own Rating", L"Player Markers", L"Card Position"};
+		values = {
+			relativeRatingsEnabled ? (chineseLanguage ? L"\u5F00\u542F" : L"On") : (chineseLanguage ? L"\u5173\u95ED" : L"Off"),
+			relativeRatingMode == 0 ? (chineseLanguage ? L"\u81EA\u52A8" : L"On") : (chineseLanguage ? L"\u5173\u95ED" : L"Off"),
+			relativeRatingShowOwn ? (chineseLanguage ? L"\u5F00\u542F" : L"On") : (chineseLanguage ? L"\u5173\u95ED" : L"Off"),
+			relativeRatingMarkers ? (chineseLanguage ? L"\u5F00\u542F" : L"On") : (chineseLanguage ? L"\u5173\u95ED" : L"Off"),
+			relativeRatingPosition == 0 ? (chineseLanguage ? L"\u5934\u4E0A" : L"Above") : relativeRatingPosition == 1 ? (chineseLanguage ? L"\u8EAB\u4E0A" : L"Center") : (chineseLanguage ? L"\u53F3\u4FA7" : L"Right")
+		};
+	}
+	for (unsigned i = 0; i < names.size(); ++i) {
+		createLocalizedSprite(this->_ratingLabels[i], names[i], 16, {330, 24});
+		createLocalizedSprite(this->_ratingValues[i], values[i], 16, {220, 24});
+	}
+}
+
+void OptionsMenu::_updateRatingSettings()
+{
+	if (SokuLib::checkKeyOneshot(DIK_ESCAPE, 0, 0, 0) || SokuLib::inputMgrs.input.b == 1) {
+		this->_editingRatings = false;
+		playSound(0x29);
+		return;
+	}
+	constexpr unsigned rows = 5;
+	if (std::abs(SokuLib::inputMgrs.input.verticalAxis) == 1 ||
+		(std::abs(SokuLib::inputMgrs.input.verticalAxis) > 36 && std::abs(SokuLib::inputMgrs.input.verticalAxis) % 6 == 0)) {
+		if (SokuLib::inputMgrs.input.verticalAxis > 0)
+			this->_ratingCursor = (this->_ratingCursor + 1) % rows;
+		else
+			this->_ratingCursor = (this->_ratingCursor + rows - 1) % rows;
+		this->_refreshRatingSettings();
+		playSound(0x27);
+	}
+	const int horizontal = SokuLib::inputMgrs.input.horizontalAxis;
+	const bool changed = std::abs(horizontal) == 1 || (std::abs(horizontal) > 36 && std::abs(horizontal) % 6 == 0) ||
+		SokuLib::inputMgrs.input.a == 1 || SokuLib::checkKeyOneshot(DIK_RETURN, 0, 0, 0);
+	if (!changed)
+		return;
+	int direction = horizontal < 0 ? -1 : 1;
+	bool *toggle = nullptr;
+	const wchar_t *key = nullptr;
+	switch (this->_ratingCursor) {
+	case 0: toggle = &relativeRatingsEnabled; key = L"RelativeRatingsEnabled"; break;
+	case 2: toggle = &relativeRatingShowOwn; key = L"RelativeRatingShowOwn"; break;
+	case 3: toggle = &relativeRatingMarkers; key = L"RelativeRatingMarkers"; break;
+	case 1:
+		relativeRatingMode = relativeRatingMode == 0 ? 2 : 0;
+		if (!saveUnsigned(L"RelativeRatingMode", relativeRatingMode)) { this->_showSaveError(); return; }
+		break;
+	case 4:
+		relativeRatingPosition = (relativeRatingPosition + (direction > 0 ? 1 : 2)) % 3;
+		if (!saveUnsigned(L"RelativeRatingPosition", relativeRatingPosition)) { this->_showSaveError(); return; }
+		break;
+	}
+	if (toggle) {
+		if (!saveUnsigned(key, *toggle ? 0u : 1u)) { this->_showSaveError(); return; }
+		*toggle = !*toggle;
+		if (this->_ratingCursor == 0 && lobbyData)
+			lobbyData->relativeRatings().setEnabled(relativeRatingsEnabled);
+	}
+	this->_refreshRatingSettings();
+	playSound(0x28);
+}
+
+void OptionsMenu::_renderRatingSettings()
+{
+	this->_background.draw();
+	SokuLib::DrawUtils::RectangleShape panel;
+	panel.setPosition({40, 50});
+	panel.setSize({560, 370});
+	panel.setFillColor(SokuLib::Color{16, 23, 34, 234});
+	panel.setBorderColor(SokuLib::Color{80, 127, 156, 255});
+	panel.draw();
+	SokuLib::DrawUtils::RectangleShape accent;
+	accent.setPosition({40, 50});
+	accent.setSize({4, 370});
+	accent.setFillColor(SokuLib::Color{114, 202, 232, 255});
+	accent.setBorderColor(SokuLib::Color{114, 202, 232, 255});
+	accent.draw();
+	SokuLib::DrawUtils::RectangleShape selection;
+	selection.setPosition({50, 101 + static_cast<int>(this->_ratingCursor) * 31});
+	selection.setSize({526, 27});
+	selection.setFillColor(SokuLib::Color{101, 162, 197, 128});
+	selection.setBorderColor(SokuLib::Color{101, 162, 197, 0});
+	selection.draw();
+	this->_ratingDescription.tint = SokuLib::Color{171, 195, 212, 255};
+	this->_ratingHint.tint = SokuLib::Color{171, 195, 212, 255};
+	this->_ratingDescription.draw();
+	constexpr unsigned rows = 5;
+	for (unsigned i = 0; i < rows; ++i) {
+		int y = 105 + static_cast<int>(i) * 31;
+		this->_ratingLabels[i].setPosition({62, y});
+		this->_ratingValues[i].setPosition({380, y});
+		this->_ratingLabels[i].tint = i == this->_ratingCursor ? SokuLib::Color::White : SokuLib::Color{197, 217, 230, 255};
+		this->_ratingValues[i].tint = i == this->_ratingCursor ? SokuLib::Color{255, 220, 139, 255} : SokuLib::Color{197, 217, 230, 255};
+		this->_ratingLabels[i].draw();
+		this->_ratingValues[i].draw();
+	}
+	this->_ratingHint.draw();
+}
+
 void OptionsMenu::_applyValue(Option &option, int delta)
 {
 	int next = static_cast<int>(option.index) + delta;
@@ -692,6 +844,10 @@ int OptionsMenu::onProcess()
 		this->_updateMessageEditor();
 		return true;
 	}
+	if (this->_editingRatings) {
+		this->_updateRatingSettings();
+		return true;
+	}
 	if (SokuLib::checkKeyOneshot(DIK_ESCAPE, 0, 0, 0) || SokuLib::inputMgrs.input.b == 1) {
 		playSound(0x29);
 		return false;
@@ -726,6 +882,10 @@ int OptionsMenu::onProcess()
 
 int OptionsMenu::onRender()
 {
+	if (this->_editingRatings) {
+		this->_renderRatingSettings();
+		return 0;
+	}
 	if (this->_editingMessages) {
 		this->_renderMessageEditor();
 		return 0;

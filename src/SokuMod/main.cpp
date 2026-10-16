@@ -326,6 +326,13 @@ unsigned lobbyJoinInterval;
 unsigned maxChatMessages;
 unsigned opponentChatColor = 0x7FA6D9;
 bool showTextBubbles = true;
+bool relativeRatingsEnabled = false;
+unsigned relativeRatingMode = 0;
+bool relativeRatingShowOwn = true;
+bool relativeRatingMarkers = false;
+unsigned relativeRatingPosition = 2;
+int relativeRatingOffsetX = 0;
+int relativeRatingOffsetY = 0;
 ChatPopupMode chatPopupMode = CHAT_POPUP_ALL;
 unsigned short servPort;
 unsigned short hostPort;
@@ -1415,6 +1422,17 @@ extern "C" __declspec(dllexport) bool Initialize(HMODULE hMyModule, HMODULE hPar
 	lobbyJoinInterval = GetPrivateProfileIntW(L"Lobby", L"JoinInterval", 1, profilePath);
 	maxChatMessages = GetPrivateProfileIntW(L"Lobby", L"MaxChatMessages", 100, profilePath);
 	showTextBubbles = GetPrivateProfileIntW(L"Lobby", L"ShowTextBubbles", 1, profilePath) != 0;
+	relativeRatingsEnabled = GetPrivateProfileIntW(L"Lobby", L"RelativeRatingsEnabled", 0, profilePath) != 0;
+	relativeRatingMode = (std::min)(GetPrivateProfileIntW(L"Lobby", L"RelativeRatingMode", 0, profilePath), 2u);
+	// Mode 1 used to mean manual selection. Preserve the old setting as automatic;
+	// the only persistent choices are now automatic and off.
+	if (relativeRatingMode == 1)
+		relativeRatingMode = 0;
+	relativeRatingShowOwn = GetPrivateProfileIntW(L"Lobby", L"RelativeRatingShowOwn", 1, profilePath) != 0;
+	relativeRatingMarkers = GetPrivateProfileIntW(L"Lobby", L"RelativeRatingMarkers", 0, profilePath) != 0;
+	relativeRatingPosition = (std::min)(GetPrivateProfileIntW(L"Lobby", L"RelativeRatingPosition", 2, profilePath), 2u);
+	relativeRatingOffsetX = (std::clamp)(static_cast<int>(GetPrivateProfileIntW(L"Lobby", L"RelativeRatingOffsetX", 0, profilePath)), -300, 300);
+	relativeRatingOffsetY = (std::clamp)(static_cast<int>(GetPrivateProfileIntW(L"Lobby", L"RelativeRatingOffsetY", 0, profilePath)), -300, 300);
 	{
 		wchar_t popupMode[32];
 		GetPrivateProfileStringW(L"Lobby", L"ChatPopupMode", L"All", popupMode, sizeof(popupMode) / sizeof(*popupMode), profilePath);

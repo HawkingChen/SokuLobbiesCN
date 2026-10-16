@@ -28,6 +28,8 @@
 #include "getPublicIp.hpp"
 #include "ipv6map_extern.hpp"
 #include "Blocklist.hpp"
+#include "IniConfig.hpp"
+#include "InputBox.hpp"
 
 #define CHAT_CHARACTER_LIMIT 512
 #define BOX_TEXTURE_SIZE {0x2000, 30}
@@ -1454,6 +1456,7 @@ int InLobbyMenu::onProcess()
 		this->_playersById.reserve(this->_playersCopy.size());
 		for (const auto &player : this->_playersCopy)
 			this->_playersById.emplace(player.id, &player);
+		this->_updateRelativeRatingTarget();
 		this->_playersInsideElevator.clear();
 		this->_playersInsideElevator.reserve(this->_insideElevator.size());
 		this->_playersInsideElevator.insert(this->_insideElevator.begin(), this->_insideElevator.end());
@@ -1987,6 +1990,7 @@ int InLobbyMenu::onRender()
 		}
 		this->_renderTextBubbles(this->_playersById);
 		this->_renderEmoteBubbles(this->_playersById);
+		this->_renderRelativeRatings();
 		this->_translate = oldTranslate;
 		if (this->_currentMachine)
 			this->_renderMachineOverlay();
@@ -2007,6 +2011,328 @@ int InLobbyMenu::onRender()
 		);
 	}
 	return 0;
+}
+
+void InLobbyMenu::_updateRelativeRatingTarget()
+{
+	// Track the physical key state even while a text box/modal blocks controls. Otherwise
+	// a key held through the modal closing looks like a fresh press on the next frame.
+	const bool f8Down = (GetAsyncKeyState(VK_F8) & 0x8000) != 0;
+	const bool f10Down = (GetAsyncKeyState(VK_F10) & 0x8000) != 0;
+	const bool f8Pressed = f8Down && !this->_relativeRatingF8WasDown;
+	const bool f10Pressed = f10Down && !this->_relativeRatingF10WasDown;
+	this->_relativeRatingF8WasDown = f8Down;
+	this->_relativeRatingF10WasDown = f10Down;
+	const bool controlsAllowed = !this->_editingText && !this->_emotePickerOpen && !this->_quickMessageMenuOpen &&
+		!inputBoxShown && GetForegroundWindow() == SokuLib::window;
+	if (this->_relativeRatingLastConfiguredMode != relativeRatingMode) {
+		this->_relativeRatingLastConfiguredMode = relativeRatingMode;
+		this->_relativeRatingHotkeyMode = -1;
+		this->_relativeRatingF8Override = false;
+		if (relativeRatingMode != 0)
+			this->_relativeRatingTarget = UINT32_MAX;
+	}
+	int displayMode = this->_relativeRatingHotkeyMode >= 0 ? this->_relativeRatingHotkeyMode : static_cast<int>(relativeRatingMode);
+	bool restoredFromHotkeyOff = false;
+	if (controlsAllowed && f10Pressed && relativeRatingsEnabled && lobbyData && this->_connection->isInit()) {
+		if (displayMode == 2) {
+			this->_relativeRatingHotkeyMode = relativeRatingMode == 2 ? 0 : static_cast<int>(relativeRatingMode);
+			displayMode = this->_relativeRatingHotkeyMode;
+			restoredFromHotkeyOff = true;
+		} else {
+			this->_relativeRatingHotkeyMode = 2;
+			displayMode = 2;
+		}
+	}
+
+	if (!relativeRatingsEnabled || !lobbyData || !this->_connection->isInit()) {
+		this->_relativeRatingHotkeyMode = -1;
+		this->_relativeRatingTarget = UINT32_MAX;
+		this->_relativeRatingCandidate = UINT32_MAX;
+		this->_relativeRatingF8Override = false;
+		this->_relativeRatingPositionInitialized = false;
+		this->_relativeRatingCards.clear();
+		return;
+	}
+	auto me = this->_connection->getMe();
+	if (!me) {
+		this->_relativeRatingTarget = UINT32_MAX;
+		this->_relativeRatingCandidate = UINT32_MAX;
+		this->_relativeRatingF8Override = false;
+		this->_relativeRatingPositionInitialized = false;
+		return;
+	}
+	const bool moved = this->_relativeRatingPositionInitialized &&
+		(me->pos.x != this->_relativeRatingLastPosition.x || me->pos.y != this->_relativeRatingLastPosition.y);
+	this->_relativeRatingLastPosition = me->pos;
+	this->_relativeRatingPositionInitialized = true;
+	if (moved) {
+		this->_relativeRatingF8Override = false;
+		this->_relativeRatingCandidate = UINT32_MAX;
+	}
+	if (controlsAllowed && f8Pressed && displayMode == 0) {
+		std::vector<std::pair<std::uint64_t, uint32_t>> nearby;
+		for (const auto &player : this->_playersCopy) {
+			if (!player.id || player.id == me->id)
+				continue;
+			const auto dx = static_cast<std::int64_t>(player.pos.x) - me->pos.x;
+			const auto dy = static_cast<std::int64_t>(player.pos.y) - me->pos.y;
+			const auto distance = static_cast<std::uint64_t>(dx * dx + dy * dy);
+			if (distance <= 450u * 450u)
+				nearby.emplace_back(distance, player.id);
+		}
+		std::sort(nearby.begin(), nearby.end());
+		if (!nearby.empty()) {
+			auto selected = std::find_if(nearby.begin(), nearby.end(), [this](const auto &entry) { return entry.second == this->_relativeRatingTarget; });
+			this->_relativeRatingTarget = selected == nearby.end() || ++selected == nearby.end() ? nearby.front().second : selected->second;
+			this->_relativeRatingF8Override = true;
+			this->_relativeRatingCandidate = UINT32_MAX;
+		}
+	}
+	if (displayMode == 2) {
+		this->_relativeRatingCandidate = UINT32_MAX;
+		return;
+	}
+	if (displayMode != 0 || this->_relativeRatingF8Override) {
+		if (this->_relativeRatingTarget != UINT32_MAX) {
+			const auto target = std::find_if(this->_playersCopy.begin(), this->_playersCopy.end(), [this](const auto &player) {
+				return player.id == this->_relativeRatingTarget;
+			});
+			if (!me || target == this->_playersCopy.end())
+				this->_relativeRatingTarget = UINT32_MAX;
+			else {
+				const auto dx = static_cast<std::int64_t>(target->pos.x) - me->pos.x;
+				const auto dy = static_cast<std::int64_t>(target->pos.y) - me->pos.y;
+				if (static_cast<std::uint64_t>(dx * dx + dy * dy) > 450u * 450u) {
+					this->_relativeRatingTarget = UINT32_MAX;
+					this->_relativeRatingF8Override = false;
+				}
+			}
+		}
+		return;
+	}
+	std::uint64_t bestDistance = 450u * 450u + 1;
+	uint32_t closest = UINT32_MAX;
+	for (const auto &player : this->_playersCopy) {
+		if (!player.id || player.id == me->id)
+			continue;
+		const auto dx = static_cast<std::int64_t>(player.pos.x) - me->pos.x;
+		const auto dy = static_cast<std::int64_t>(player.pos.y) - me->pos.y;
+		const auto distance = static_cast<std::uint64_t>(dx * dx + dy * dy);
+		if (distance <= 450u * 450u && distance < bestDistance) {
+			bestDistance = distance;
+			closest = player.id;
+		}
+	}
+	if (restoredFromHotkeyOff && closest != UINT32_MAX) {
+		this->_relativeRatingTarget = closest;
+		this->_relativeRatingCandidate = UINT32_MAX;
+		return;
+	}
+	if (closest == UINT32_MAX) {
+		this->_relativeRatingTarget = UINT32_MAX;
+		this->_relativeRatingCandidate = UINT32_MAX;
+	} else if (closest == this->_relativeRatingTarget) {
+		this->_relativeRatingCandidate = UINT32_MAX;
+	} else if (closest != this->_relativeRatingCandidate) {
+		this->_relativeRatingCandidate = closest;
+		this->_relativeRatingCandidateSince = std::chrono::steady_clock::now();
+	} else if (std::chrono::steady_clock::now() - this->_relativeRatingCandidateSince >= std::chrono::milliseconds(300)) {
+		this->_relativeRatingTarget = closest;
+		this->_relativeRatingCandidate = UINT32_MAX;
+	}
+}
+
+void InLobbyMenu::_renderRelativeRatings()
+{
+	if (!relativeRatingsEnabled || !lobbyData)
+		return;
+	const auto me = this->_connection->getMe();
+	if (!me)
+		return;
+	auto characterName = [](const std::string &code) {
+		static const std::map<std::string, std::wstring> names = {
+			{"reimu", L"\u7075\u68A6"}, {"marisa", L"\u9B54\u7406\u6C99"}, {"sakuya", L"\u54B2\u591C"}, {"alice", L"\u7231\u4E3D\u4E1D"},
+			{"patchouli", L"\u5E15\u79CB\u8389"}, {"youmu", L"\u5996\u68A6"}, {"remilia", L"\u857E\u7C73"}, {"yuyuko", L"\u5E7D\u5E7D\u5B50"},
+			{"yukari", L"\u7D2B"}, {"suika", L"\u8403\u9999"}, {"reisen", L"\u94C3\u4ED9"}, {"aya", L"\u6587"}, {"komachi", L"\u5C0F\u753A"},
+			{"iku", L"\u8863\u7396"}, {"tenshi", L"\u5929\u5B50"}, {"sanae", L"\u65E9\u82D7"}, {"cirno", L"\u742A\u9732\u8BFA"},
+			{"meiling", L"\u7F8E\u94C3"}, {"utsuho", L"\u7A7A"}, {"suwako", L"\u8B39\u8BBF\u5B50"}
+		};
+		auto found = names.find(code);
+		if (found != names.end())
+			return found->second;
+		return convertEncoding<char, wchar_t, UTF8Decode, UTF16Encode>(code);
+	};
+	auto makeLines = [&](const Player &player, bool own) {
+		std::vector<std::wstring> lines;
+		RelativeRatings::Rating rating;
+		const auto playerName = convertEncoding<char, wchar_t, UTF8Decode, UTF16Encode>(player.name);
+		lines.push_back(playerName);
+		if (!lobbyData->relativeRatings().lookup(player.name, rating)) {
+			if (!lobbyData->relativeRatings().hasData())
+				lines.push_back(chineseLanguage ? L"\u8BC4\u5206\u6570\u636E\u672A\u8F7D\u5165" : L"Ratings data not loaded");
+			else
+				lines.push_back(chineseLanguage ? L"\u8BC4\u5206\u672A\u77E5" : L"Rating unavailable");
+			return lines;
+		}
+		wchar_t score[96];
+		std::swprintf(score, 96, L"%.0f  \u00B1%.0f", rating.value, rating.deviation);
+		lines.push_back(score);
+		for (const auto &character : rating.characters) {
+			wchar_t line[80];
+			std::swprintf(line, 80, L"%ls  %.0f", characterName(character.code).c_str(), character.rating);
+			lines.emplace_back(line);
+		}
+		return lines;
+	};
+	auto drawCard = [&](uint32_t id, const Player &player, bool own, int anchorX, int anchorY) {
+		auto lines = makeLines(player, own);
+		std::string fingerprint;
+		for (const auto &line : lines) {
+			fingerprint += convertEncoding<wchar_t, char, UTF16Decode, UTF8Encode>(line);
+			fingerprint.push_back('\n');
+		}
+		RelativeRatings::Rating styledRating;
+		const bool rated = lobbyData->relativeRatings().lookup(player.name, styledRating);
+		auto scoreColor = [](double value) {
+			if (value >= 2800) return SokuLib::Color{255, 112, 136, 255};
+			if (value >= 2500) return SokuLib::Color{231, 148, 245, 255};
+			if (value >= 2300) return SokuLib::Color{255, 208, 113, 255};
+			if (value >= 2000) return SokuLib::Color{139, 215, 255, 255};
+			if (value >= 1800) return SokuLib::Color{167, 230, 155, 255};
+			return SokuLib::Color{197, 207, 221, 255};
+		};
+		const auto accent = rated ? scoreColor(styledRating.value) : SokuLib::Color{142, 156, 173, 255};
+		auto &card = this->_relativeRatingCards[id];
+		if (card.content != fingerprint) {
+			card.content = std::move(fingerprint);
+			card.lines.clear();
+			for (unsigned lineIndex = 0; lineIndex < lines.size(); ++lineIndex) {
+				const auto &line = lines[lineIndex];
+				SokuLib::DrawUtils::Sprite text;
+				SokuLib::Vector2i textSize;
+				int textureId = 0;
+				auto &font = lobbyData->getFont(lineIndex == 1 && rated ? 14 : 12);
+				const auto shadow = font.description.shadow;
+				const auto offsetX = font.description.offsetX;
+				// Some glyphs extend left of their advance origin. Keep their pixels
+				// inside the texture rather than clipping them at its left edge.
+				constexpr int horizontalPadding = 4;
+				font.description.offsetX = offsetX + horizontalPadding;
+				const bool sharp = std::all_of(line.begin(), line.end(), [](wchar_t chr) { return chr < 0x80; });
+				if (!sharp)
+					font.description.shadow = 0;
+				bool created = createTextTexture(textureId, line.c_str(), font, {188, 22}, &textSize, sharp);
+				font.description.shadow = shadow;
+				font.description.offsetX = offsetX;
+				if (!created)
+					continue;
+				textSize.x = (std::min)(188, textSize.x + horizontalPadding * 2);
+				text.texture.setHandle(textureId, {188, 22});
+				text.setSize(textSize.to<unsigned>());
+				text.rect = {0, 0, textSize.x, textSize.y};
+				card.lines.push_back(std::move(text));
+			}
+		}
+		const int characterRows = (std::max)(0, static_cast<int>(card.lines.size()) - 2);
+		const int height = characterRows ? 58 + characterRows * 18 : 52;
+		const int width = 208;
+		int x = own ? 8 : anchorX - width / 2 + relativeRatingOffsetX;
+		int y = own ? 8 : anchorY - height - 52 + relativeRatingOffsetY;
+		if (!own && relativeRatingPosition == 1)
+			y = anchorY - height / 2 + relativeRatingOffsetY;
+		else if (!own && relativeRatingPosition == 2) {
+			x = anchorX + 40 + relativeRatingOffsetX;
+			y = anchorY - height / 2 + relativeRatingOffsetY;
+			if (x + width > 636)
+				x = anchorX - width - 40 + relativeRatingOffsetX;
+		}
+		x = (std::clamp)(x, 4, 636 - width);
+		y = (std::clamp)(y, 4, 476 - height);
+		auto rectangle = [](int left, int top, unsigned width, unsigned height, SokuLib::Color fill, SokuLib::Color border) {
+			SokuLib::DrawUtils::RectangleShape shape;
+			shape.setPosition({left, top});
+			shape.setSize({width, height});
+			shape.setFillColor(fill);
+			shape.setBorderColor(border);
+			shape.draw();
+		};
+		rectangle(x + 3, y + 4, width, height, {3, 8, 15, 90}, {0, 0, 0, 0});
+		SokuLib::DrawUtils::RectangleShape panel;
+		panel.setPosition({x, y});
+		panel.setSize({static_cast<unsigned>(width), static_cast<unsigned>(height)});
+		panel.setFillColor(SokuLib::Color{17, 27, 42, 224});
+		panel.setBorderColor(SokuLib::Color{105, 142, 165, 125});
+		panel.draw();
+		rectangle(x + 1, y + 1, width - 2, 23, {32, 49, 68, 205}, {0, 0, 0, 0});
+		if (characterRows)
+			rectangle(x + 10, y + 51, width - 20, 1, {110, 145, 167, 75}, {0, 0, 0, 0});
+		SokuLib::DrawUtils::RectangleShape stripe;
+		stripe.setPosition({x, y});
+		stripe.setSize({2, 24});
+		stripe.setFillColor(accent);
+		stripe.setBorderColor(accent);
+		stripe.draw();
+		for (unsigned i = 0; i < card.lines.size(); ++i) {
+			card.lines[i].tint = i == 0 ? SokuLib::Color{159, 219, 255, 255} :
+				!rated ? SokuLib::Color{180, 196, 212, 255} : i == 1 ? accent :
+				i - 2 < styledRating.characters.size() ? scoreColor(styledRating.characters[i - 2].rating) : accent;
+			const int rowY = i == 0 ? 5 : i == 1 ? 28 : 57 + static_cast<int>(i - 2) * 18;
+			card.lines[i].setPosition({x + 6, y + rowY});
+			card.lines[i].draw();
+		}
+	};
+	for (const auto &player : this->_playersCopy) {
+		if (player.id == me->id && relativeRatingShowOwn)
+			drawCard(player.id, player, true, 0, 0);
+		else if ((this->_relativeRatingHotkeyMode >= 0 ? this->_relativeRatingHotkeyMode : static_cast<int>(relativeRatingMode)) != 2 && player.id == this->_relativeRatingTarget)
+			drawCard(player.id, player, false,
+				static_cast<int>(this->_translate.x + player.pos.x * this->_zoom),
+				static_cast<int>(this->_translate.y + player.pos.y * this->_zoom));
+		if (!relativeRatingMarkers || player.id == me->id)
+			continue;
+		RelativeRatings::Rating ownRating, otherRating;
+		if (!lobbyData->relativeRatings().lookup(me->name, ownRating) || !lobbyData->relativeRatings().lookup(player.name, otherRating))
+			continue;
+		const bool easier = ownRating.value - otherRating.value >= 100;
+		const bool harder = otherRating.value - ownRating.value >= 300;
+		if (!easier && !harder)
+			continue;
+		const int x = static_cast<int>(this->_translate.x + (player.pos.x - 32) * this->_zoom);
+		const int y = static_cast<int>(this->_translate.y + (player.pos.y - 112) * this->_zoom);
+		if (x > 640 || x < -80 || y > 480 || y < -100)
+			continue;
+		const int width = static_cast<int>((std::max)(44.f, 64.f * this->_zoom));
+		const int height = static_cast<int>((std::max)(70.f, 96.f * this->_zoom));
+		auto segment = [](int left, int top, unsigned width, unsigned height, SokuLib::Color color) {
+			SokuLib::DrawUtils::RectangleShape shape;
+			shape.setPosition({left, top});
+			shape.setSize({width, height});
+			shape.setFillColor(color);
+			shape.setBorderColor(SokuLib::Color{0, 0, 0, 0});
+			shape.draw();
+		};
+		if (easier) {
+			const int footY = static_cast<int>(this->_translate.y + player.pos.y * this->_zoom) + 2;
+			const int centerX = static_cast<int>(this->_translate.x + player.pos.x * this->_zoom);
+			const int span = width * 3 / 4;
+			segment(centerX - span / 2 - 3, footY - 2, span + 6, 6, {100, 217, 176, 35});
+			segment(centerX - span / 2, footY, span, 2, {120, 230, 190, 190});
+			segment(centerX - span / 2, footY - 3, 2, 3, {120, 230, 190, 150});
+			segment(centerX + span / 2 - 2, footY - 3, 2, 3, {120, 230, 190, 150});
+		} else {
+			// Short corner brackets leave the character and name unobstructed.
+			const unsigned length = static_cast<unsigned>((std::max)(7.f, 10.f * this->_zoom));
+			for (int side = 0; side < 2; ++side) {
+				for (int edge = 0; edge < 2; ++edge) {
+					const int cornerX = x + (side ? width - 2 : 0);
+					const int cornerY = y + (edge ? height - 2 : 0);
+					segment(side ? x + width - length : x, cornerY, length, 2, {240, 128, 142, 200});
+					segment(cornerX, edge ? y + height - length : y, 2, length, {240, 128, 142, 200});
+				}
+			}
+		}
+	}
 }
 
 void InLobbyMenu::_unhook()
