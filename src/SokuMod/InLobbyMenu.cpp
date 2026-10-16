@@ -684,7 +684,7 @@ InLobbyMenu::InLobbyMenu(LobbyMenu *menu, SokuLib::MenuConnect *parent, std::sha
 	this->_connection->onImpMsg = [this](const std::string &msg){
 		this->_openMessageBox(23, localizeLobbyMessage(msg), chineseLanguage ? "服务器通知" : "Notification from server", MB_ICONINFORMATION);
 	};
-	this->_connection->onMsg = [this](int32_t channel, int32_t player, const std::string &msg){
+	this->_connection->onMsg = [this](int32_t channel, int32_t player, const std::string &msg, const std::string &senderName){
 		if (channel == Lobbies::BLOCKLIST_CONTROL_CHANNEL && msg == "BLOCKCAP1") {
 			// Synchronization is sent optimistically for compatibility with older
 			// block-enabled servers which do not return BLOCKCAP1.
@@ -734,17 +734,8 @@ InLobbyMenu::InLobbyMenu(LobbyMenu *menu, SokuLib::MenuConnect *parent, std::sha
 		bool opponentDisconnected = false;
 		bool opponentJoined = false;
 		bool opponentMessage = false;
-		// IDs can be reused after a disconnect. Resolve the current sender
-		// from the connection, not the cached opponent ID or UI player copy.
-		std::string senderName;
-		if (player != 0) {
-			const auto players = this->_connection->getPlayers();
-			auto sender = std::find_if(players.begin(), players.end(), [player](const Player &p) {
-				return p.id == player;
-			});
-			if (sender != players.end())
-				senderName = sender->name;
-		}
+		// The connection supplies the current sender name under its player lock.
+		// Do not call getPlayers() here: this callback runs with that lock held.
 		if (privateMessage)
 			colorOverride = opponentChatColor;
 		{

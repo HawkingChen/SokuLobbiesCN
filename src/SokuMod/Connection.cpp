@@ -504,8 +504,17 @@ bool Connection::_handlePacket(const Lobbies::PacketMessage &packet, size_t &siz
 		return false;
 	}
 	size -= sizeof(packet);
-	if (this->onMsg)
-		this->onMsg(packet.channelId, packet.playerId, std::string(packet.message, strnlen(packet.message, sizeof(packet.message))));
+	if (this->onMsg) {
+		// The packet dispatcher already holds _playerMutex. Resolve and copy
+		// the current name here so callbacks never need to lock it again.
+		std::string senderName;
+		if (packet.playerId != 0) {
+			auto sender = this->_players.find(packet.playerId);
+			if (sender != this->_players.end())
+				senderName = sender->second.name;
+		}
+		this->onMsg(packet.channelId, packet.playerId, std::string(packet.message, strnlen(packet.message, sizeof(packet.message))), senderName);
+	}
 	return true;
 }
 
