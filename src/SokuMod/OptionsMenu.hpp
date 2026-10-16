@@ -35,6 +35,13 @@ private:
 	SokuLib::DrawUtils::Sprite _hint;
 	SokuLib::DrawUtils::Sprite _status;
 	bool _editingMessages = false;
+	bool _editingRatings = false;
+	unsigned _ratingPage = 0;
+	unsigned _ratingCursor = 0;
+	SokuLib::DrawUtils::Sprite _ratingDescription;
+	SokuLib::DrawUtils::Sprite _ratingHint;
+	std::vector<SokuLib::DrawUtils::Sprite> _ratingLabels;
+	std::vector<SokuLib::DrawUtils::Sprite> _ratingValues;
 	bool _capturingChatKey = false;
 	bool _chatKeyCaptureArmed = false;
 	unsigned _messageCursor = 0;
@@ -53,6 +60,9 @@ private:
 	void _openMessageEditor(unsigned index);
 	void _updateMessageEditor();
 	void _renderMessageEditor();
+	void _refreshRatingSettings();
+	void _updateRatingSettings();
+	void _renderRatingSettings();
 	void _updateChatKeyCapture();
 	void _refreshLanguage();
 

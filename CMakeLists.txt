@@ -175,6 +175,8 @@ if ("${CMAKE_CXX_COMPILER_ID}" STREQUAL "MSVC")
 		src/SokuMod/OptionsMenu.hpp
 		src/SokuMod/LobbyData.cpp
 		src/SokuMod/LobbyData.hpp
+		src/SokuMod/RelativeRatings.cpp
+		src/SokuMod/RelativeRatings.hpp
 		src/SokuMod/SmallHostlist.cpp
 		src/SokuMod/SmallHostlist.hpp
 		src/SokuMod/BackgroundHost.cpp
@@ -188,6 +190,7 @@ if ("${CMAKE_CXX_COMPILER_ID}" STREQUAL "MSVC")
 	)
 	target_compile_options(SokuLobbiesMod PRIVATE /Zi /utf-8)
 	target_compile_definitions("SokuLobbiesMod" PRIVATE DIRECTINPUT_VERSION=0x0800 _CRT_SECURE_NO_WARNINGS)
+	target_compile_definitions(SokuLobbiesMod PRIVATE $<$<CONFIG:Debug>:SOKU_RATINGS_DIAGNOSTICS=1>)
 	target_link_libraries(
 		SokuLobbiesMod
 		SokuLib

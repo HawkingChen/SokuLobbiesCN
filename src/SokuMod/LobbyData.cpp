@@ -876,10 +876,14 @@ LobbyData::LobbyData()
 	this->achHolder.behindGear.setPosition((this->achHolder.behindGear.getSize() * -1).to<int>());
 
 	curl_global_init(CURL_GLOBAL_ALL);
+	this->_relativeRatings = std::make_unique<RelativeRatings>(profileFolderPath);
+	this->_relativeRatings->setEnabled(relativeRatingsEnabled);
 }
 
 LobbyData::~LobbyData()
 {
+	if (this->_relativeRatings)
+		this->_relativeRatings->stop();
 	this->saveStats();
 	this->saveAchievements();
 	for (auto &font : this->_fonts)
