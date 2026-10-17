@@ -295,8 +295,8 @@ bool RelativeRatings::_publish(const std::string &text)
 				std::stable_sort(record.characters.begin(), record.characters.end(), [](const auto &left, const auto &right) {
 					return left.games == right.games ? left.rating > right.rating : left.games > right.games;
 				});
-				if (record.characters.size() > 3)
-					record.characters.resize(3);
+				if (record.characters.size() > 4)
+					record.characters.resize(4);
 			}
 			++nameCounts[record.name];
 			if (!record.playedAs.empty())

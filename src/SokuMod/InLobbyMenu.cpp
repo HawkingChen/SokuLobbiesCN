@@ -2208,6 +2208,11 @@ void InLobbyMenu::_renderRelativeRatings()
 			return found->second;
 		return convertEncoding<char, wchar_t, UTF8Decode, UTF16Encode>(code);
 	};
+	auto portraitFor = [&](const std::string &code) -> SokuLib::DrawUtils::Sprite * {
+		// Use the same character emote icons as the spectator list.
+		const auto found = lobbyData->emotesByName.find(code + "1");
+		return found == lobbyData->emotesByName.end() ? nullptr : &found->second->sprite;
+	};
 	auto makeLines = [&](const Player &player, bool own) {
 		std::vector<std::wstring> lines;
 		RelativeRatings::Rating rating;
@@ -2225,7 +2230,10 @@ void InLobbyMenu::_renderRelativeRatings()
 		lines.push_back(score);
 		for (const auto &character : rating.characters) {
 			wchar_t line[80];
-			std::swprintf(line, 80, L"%ls  %.0f", characterName(character.code).c_str(), character.rating);
+			if (portraitFor(character.code))
+				std::swprintf(line, 80, L"%.0f", character.rating);
+			else
+				std::swprintf(line, 80, L"%ls  %.0f", characterName(character.code).c_str(), character.rating);
 			lines.emplace_back(line);
 		}
 		return lines;
@@ -2239,6 +2247,8 @@ void InLobbyMenu::_renderRelativeRatings()
 		}
 		RelativeRatings::Rating styledRating;
 		const bool rated = lobbyData->relativeRatings().lookup(player.name, styledRating);
+		for (const auto &character : styledRating.characters)
+			fingerprint += "\t" + character.code;
 		auto scoreColor = [](double value) {
 			if (value >= 2800) return SokuLib::Color{255, 112, 136, 255};
 			if (value >= 2500) return SokuLib::Color{231, 148, 245, 255};
@@ -2267,24 +2277,34 @@ void InLobbyMenu::_renderRelativeRatings()
 				const bool sharp = std::all_of(line.begin(), line.end(), [](wchar_t chr) { return chr < 0x80; });
 				if (!sharp)
 					font.description.shadow = 0;
-				bool created = createTextTexture(textureId, line.c_str(), font, {188, 22}, &textSize, sharp);
+				bool created = createTextTexture(textureId, line.c_str(), font, {300, 22}, &textSize, sharp);
 				font.description.shadow = shadow;
 				font.description.offsetX = offsetX;
 				if (!created)
 					continue;
-				textSize.x = (std::min)(188, textSize.x + horizontalPadding * 2);
-				text.texture.setHandle(textureId, {188, 22});
+				textSize.x = (std::min)(300, textSize.x + horizontalPadding * 2);
+				text.texture.setHandle(textureId, {300, 22});
 				text.setSize(textSize.to<unsigned>());
 				text.rect = {0, 0, textSize.x, textSize.y};
 				card.lines.push_back(std::move(text));
 			}
 		}
-		const int characterRows = (std::max)(0, static_cast<int>(card.lines.size()) - 2);
-		const int height = characterRows ? 58 + characterRows * 18 : 52;
+		const int characterCount = rated ? (std::max)(0, static_cast<int>(card.lines.size()) - 2) : 0;
+		const int characterRows = (characterCount + 1) / 2;
+		const int height = characterRows ? 58 + characterRows * 22 : 52;
 		int width = 120;
-		for (const auto &line : card.lines)
-			width = (std::max)(width, static_cast<int>(line.getSize().x) + 18);
-		width = (std::min)(width, 208);
+		int columnWidths[2] = {0, 0};
+		for (unsigned i = 0; i < card.lines.size(); ++i) {
+			if (rated && i >= 2 && i - 2 < styledRating.characters.size()) {
+				const int column = (i - 2) % 2;
+				const int iconSpace = portraitFor(styledRating.characters[i - 2].code) ? 24 : 0;
+				columnWidths[column] = (std::max)(columnWidths[column], static_cast<int>(card.lines[i].getSize().x) + iconSpace);
+			} else
+				width = (std::max)(width, static_cast<int>(card.lines[i].getSize().x) + 18);
+		}
+		if (characterCount)
+			width = (std::max)(width, columnWidths[0] + columnWidths[1] + (characterCount > 1 ? 32 : 20));
+		width = (std::min)(width, 320);
 		int x = own ? 8 : anchorX - width / 2 + relativeRatingOffsetX;
 		int y = own ? 8 : anchorY - height - 52 + relativeRatingOffsetY;
 		if (!own && relativeRatingPosition == 1)
@@ -2325,8 +2345,27 @@ void InLobbyMenu::_renderRelativeRatings()
 			card.lines[i].tint = i == 0 ? SokuLib::Color{159, 219, 255, 255} :
 				!rated ? SokuLib::Color{180, 196, 212, 255} : i == 1 ? accent :
 				i - 2 < styledRating.characters.size() ? scoreColor(styledRating.characters[i - 2].rating) : accent;
-			const int rowY = i == 0 ? 5 : i == 1 ? 28 : 57 + static_cast<int>(i - 2) * 18;
-			card.lines[i].setPosition({x + 6, y + rowY});
+			const int rowY = i == 0 ? 5 : i == 1 ? 28 : 57 + static_cast<int>((i - 2) / 2) * 22;
+			const int columnX = rated && i >= 2 && (i - 2) % 2 ? columnWidths[0] + 12 : 0;
+			auto portrait = i >= 2 && rated && i - 2 < styledRating.characters.size()
+				? portraitFor(styledRating.characters[i - 2].code) : nullptr;
+			if (portrait) {
+				const auto oldRect = portrait->rect;
+				const auto oldTint = portrait->tint;
+				const auto oldSize = portrait->getSize();
+				const auto oldPosition = portrait->getPosition();
+				const auto textureSize = portrait->texture.getSize();
+				portrait->rect = {0, 0, static_cast<int>(textureSize.x), static_cast<int>(textureSize.y)};
+				portrait->tint = SokuLib::Color::White;
+				portrait->setSize({16, 16});
+				portrait->setPosition({x + 10 + columnX, y + rowY - 1});
+				portrait->draw();
+				portrait->rect = oldRect;
+				portrait->tint = oldTint;
+				portrait->setSize(oldSize);
+				portrait->setPosition(oldPosition);
+			}
+			card.lines[i].setPosition({x + columnX + (portrait ? 30 : 6), y + rowY});
 			card.lines[i].draw();
 		}
 	};
