@@ -47,6 +47,7 @@ extern int relativeRatingOffsetY;
 extern ChatPopupMode chatPopupMode;
 extern unsigned hostPref;
 extern unsigned chatKey;
+extern unsigned battleChatHoldMs;
 extern bool chineseLanguage;
 extern std::wstring quickMessages[9];
 extern unsigned short servPort;

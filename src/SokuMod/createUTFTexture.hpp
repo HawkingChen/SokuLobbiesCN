@@ -8,7 +8,7 @@
 #include <cstddef>
 #include <SokuLib.hpp>
 
-bool createTextTexture(int &retId, const wchar_t* text, SokuLib::SWRFont& font, SokuLib::Vector2i texsize, SokuLib::Vector2i *size, bool sharp = false);
+bool createTextTexture(int &retId, const wchar_t* text, SokuLib::SWRFont& font, SokuLib::Vector2i texsize, SokuLib::Vector2i *size, bool sharp = false, bool outline = false);
 SokuLib::Vector2i getTextSize(const wchar_t *text, SokuLib::SWRFont &font, SokuLib::Vector2i texsize, bool sharp = false);
 size_t getTextFit(const wchar_t *text, SokuLib::SWRFont &font, int maxWidth, bool sharp = false);
 

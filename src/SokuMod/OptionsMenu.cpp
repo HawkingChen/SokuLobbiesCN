@@ -144,7 +144,8 @@ std::wstring localizedOptionName(const std::string &name)
 		{"Language", L"\u8BED\u8A00"}, {"Chat Popup Mode", L"\u804A\u5929\u5F39\u51FA\u6A21\u5F0F"}, {"Text Bubbles", L"\u804A\u5929\u6C14\u6CE1"},
 		{"Max Chat Messages", L"\u6700\u5927\u804A\u5929\u8BB0\u5F55"}, {"Chat Key", L"\u804A\u5929\u6846\u6309\u952E"}, {"Opponent Chat Color", L"\u5BF9\u624B\u804A\u5929\u989C\u8272"},
 		{"Host IP", L"\u5BF9\u6218 IP"}, {"Chat Logs", L"\u804A\u5929\u65E5\u5FD7"}, {"Reset Config", L"\u91CD\u7F6E\u914D\u7F6E"}, {"Quick Messages", L"\u5FEB\u6377\u5BF9\u8BDD"},
-		{"Rating Settings", L"\u7B49\u7EA7\u5206\u8BBE\u7F6E"}
+		{"Rating Settings", L"\u7B49\u7EA7\u5206\u8BBE\u7F6E"},
+		{"Battle Chat Hold", L"\u5BF9\u5C40\u804A\u5929\u957F\u6309"}
 	};
 	auto found = labels.find(name);
 	return found == labels.end() ? std::wstring(name.begin(), name.end()) : found->second;
@@ -161,7 +162,7 @@ std::wstring localizedChoice(const std::string &label)
 		{"Open Folder", L"\u6253\u5F00\u6587\u4EF6\u5939"}, {"Restore Defaults", L"\u6062\u590D\u9ED8\u8BA4\u914D\u7F6E"}, {"Edit 1-9", L"\u7F16\u8F91 1-9"},
 		{"Settings", L"\u8BBE\u7F6E"}, {"Automatic", L"\u81EA\u52A8"}, {"Manual (F8)", L"\u624B\u52A8 (F8)"}, {"Off", L"\u5173\u95ED"},
 		{"Above", L"\u5934\u4E0A"}, {"Center", L"\u8EAB\u4E0A"}, {"Right", L"\u53F3\u4FA7"}, {"Open Mapping", L"\u7F16\u8F91\u8D26\u53F7\u6620\u5C04"}, {"Refresh Now", L"\u7ACB\u5373\u5237\u65B0"},
-		{"Enter", L"\u56DE\u8F66"}, {"Space", L"\u7A7A\u683C"}
+		{"Enter", L"\u56DE\u8F66"}, {"Space", L"\u7A7A\u683C"}, {"Instant", L"\u76F4\u63A5\u6253\u5F00"}
 	};
 	auto found = labels.find(label);
 	return found == labels.end() ? std::wstring(label.begin(), label.end()) : found->second;
@@ -323,6 +324,18 @@ OptionsMenu::OptionsMenu(LobbyMenu *parent) :
 		}
 	});
 	this->_addOption({
+		"Battle Chat Hold",
+		{{"Instant", 0}, {"0.5 s", 500}, {"1 s", 1000}, {"1.5 s", 1500}, {"2 s", 2000}, {"3 s", 3000}, {"5 s", 5000}},
+		[] { return battleChatHoldMs; },
+		[](unsigned value) {
+			if (!saveUnsigned(L"BattleChatHoldMs", value))
+				return false;
+			battleChatHoldMs = value;
+			return true;
+		},
+		[](unsigned value) { return std::to_string(value) + " ms"; }
+	});
+	this->_addOption({
 		"Opponent Chat Color",
 		{{"Soft Blue", 0x7FA6D9}, {"Gold", 0xE0B85C}, {"Soft Pink", 0xD990B5}, {"Soft Green", 0x79B88A}, {"Orange", 0xD98B5F}, {"Purple", 0xFF00FF}, {"White", 0xFFFFFF}},
 		[] { return opponentChatColor & 0xFFFFFF; },
@@ -453,6 +466,7 @@ OptionsMenu::OptionsMenu(LobbyMenu *parent) :
 			if (name == "Rating Settings") return 3;
 			if (name == "Opponent Chat Color") return 4;
 			if (name == "Chat Key") return 5;
+			if (name == "Battle Chat Hold") return 5;
 			if (name == "Host IP") return 6;
 			if (name == "Language") return 7;
 			if (name == "Max Chat Messages") return 8;
@@ -687,13 +701,13 @@ void OptionsMenu::_refreshRatingSettings()
 			L"\u5728\u5927\u5385\u663E\u793A\u7B49\u7EA7\u5206\u5361\u7247\u3002\u6570\u636E\u5728\u540E\u53F0\u52A0\u8F7D\u5E76\u7F13\u5B58\u3002",
 			L"\u81EA\u52A8\u663E\u793A\u6700\u8FD1\u73A9\u5BB6\uFF1B\u6309 F8 \u4E34\u65F6\u5207\u6362\u4E0B\u4E00\u4F4D\u3002\n\u79FB\u52A8\u540E\u6062\u590D\u81EA\u52A8\u8DDF\u968F\u3002F10 \u4E34\u65F6\u9690\u85CF/\u6062\u590D\u5361\u7247\u3002",
 			L"\u5728\u5DE6\u4E0A\u89D2\u663E\u793A\u81EA\u5DF1\u7684\u7B49\u7EA7\u5206\u5361\u7247\u3002",
-			L"\u7EFF\u8272\u811A\u4E0B\u6807\u8BB0\uFF1A\u6BD4\u4F60\u4F4E\u81F3\u5C11 100 \u5206\u3002\n\u7EA2\u8272\u56DB\u89D2\u6807\u8BB0\uFF1A\u6BD4\u4F60\u9AD8\u81F3\u5C11 300 \u5206\u3002",
+			L"\u7EFF\u540D + \u5DE6\u4FA7\u25BC\uFF1A\u6BD4\u4F60\u4F4E\u81F3\u5C11 100 \u5206\u3002\n\u7EA2\u540D + \u5DE6\u4FA7\u25B2\uFF1A\u6BD4\u4F60\u9AD8\u81F3\u5C11 300 \u5206\u3002",
 			L"\u8C03\u6574\u9644\u8FD1\u73A9\u5BB6\u7684\u5361\u7247\u4F4D\u7F6E\uFF0C\u9760\u8FD1\u5C4F\u5E55\u8FB9\u7F18\u65F6\u81EA\u52A8\u907F\u8BA9\u3002"
 	} : std::vector<std::wstring>{
 			L"Show rating cards. Data loads and caches in the background.",
 			L"Auto shows the nearest player. F8 temporarily cycles to the next player; moving restores auto-follow.\nF10 temporarily hides/shows the card (settings unchanged).",
 			L"Show your own rating card in the top-left corner.",
-			L"Green foot marker: at least 100 points below you.\nRed corners: at least 300 points above you.",
+			L"Green name + left \u25BC: at least 100 points below you.\nRed name + left \u25B2: at least 300 points above you.",
 			L"Place nearby player cards. Cards stay inside the screen."
 	};
 	createLocalizedSprite(this->_ratingDescription, descriptions[this->_ratingCursor], 12, {518, 52});
@@ -894,13 +908,13 @@ int OptionsMenu::onRender()
 	this->_title.draw();
 	for (unsigned i = 0; i < this->_options.size(); i++) {
 		auto &option = this->_options[i];
-		int y = 106 + static_cast<int>(i) * 27;
+		int y = 106 + static_cast<int>(i) * 24;
 		option.labelSprite.setPosition({64, y});
 		option.valueSprite.setPosition({560 - static_cast<int>(option.valueSprite.getSize().x), y});
 		option.labelSprite.draw();
 		option.valueSprite.draw();
 	}
-	displayTranslucentCursor({50, 102 + static_cast<int>(this->_cursor) * 27}, {526, 22});
+	displayTranslucentCursor({50, 102 + static_cast<int>(this->_cursor) * 24}, {526, 22});
 	if (this->_statusTimer)
 		this->_status.draw();
 	else

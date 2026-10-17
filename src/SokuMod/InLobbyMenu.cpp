@@ -1939,18 +1939,34 @@ int InLobbyMenu::onRender()
 		for (auto &row : nameRows)
 			row.clear();
 
+		RelativeRatings::Rating nameMarkerOwnRating;
+		const auto nameMarkerMe = this->_connection->getMe();
+		const bool showNameMarkers = relativeRatingsEnabled && relativeRatingMarkers && lobbyData && nameMarkerMe &&
+			lobbyData->relativeRatings().lookup(nameMarkerMe->name, nameMarkerOwnRating);
+
 		for (auto &player : this->_playersCopy) {
 			auto playerData = this->_extraPlayerData.find(player.id);
 			if (playerData == this->_extraPlayerData.end())
 				continue;
 			auto &name = playerData->second.name;
-			auto minPos = this->_translate.x + player.pos.x * this->_zoom - name.getSize().x / 2.f;
-			auto maxPos = this->_translate.x + player.pos.x * this->_zoom + name.getSize().x / 2.f;
+			int nameMarker = 0;
+			if (showNameMarkers && player.id != nameMarkerMe->id) {
+				RelativeRatings::Rating rating;
+				if (lobbyData->relativeRatings().lookup(player.name, rating)) {
+					if (nameMarkerOwnRating.value - rating.value >= 100) nameMarker = 1;
+					else if (rating.value - nameMarkerOwnRating.value >= 300) nameMarker = -1;
+				}
+			}
+			// Include the triangle on its actual side in name collision detection.
+			const int leftPadding = nameMarker ? 14 : 0;
+			const int rightPadding = 0;
+			auto minPos = this->_translate.x + player.pos.x * this->_zoom - name.getSize().x / 2.f - leftPadding;
+			auto maxPos = this->_translate.x + player.pos.x * this->_zoom + name.getSize().x / 2.f + rightPadding;
 			auto posY = this->_translate.y + (player.pos.y - 120) * this->_zoom;
 			if (!isRectVisible(
 				static_cast<int>(minPos),
 				static_cast<int>(posY),
-				static_cast<int>(name.getSize().x),
+				static_cast<int>(name.getSize().x) + leftPadding + rightPadding,
 				static_cast<int>(name.getSize().y),
 				16
 			))
@@ -1981,12 +1997,38 @@ int InLobbyMenu::onRender()
 				continue;
 
 			name.setPosition({
-				static_cast<int>(minPos),
+				static_cast<int>(minPos) + leftPadding,
 				static_cast<int>(posY)
 			});
 			auto row = std::clamp(static_cast<int>(std::floor(posY / 20.f)), firstNameRow, lastNameRow);
 			nameRows[row - firstNameRow].push_back({minPos, maxPos, posY});
+			const auto originalTint = name.tint;
+			const auto markerColor = nameMarker > 0 ? SokuLib::Color{143, 224, 173, 255} : SokuLib::Color{242, 145, 153, 255};
+			if (nameMarker)
+				name.tint = markerColor;
 			name.draw();
+			name.tint = originalTint;
+			if (nameMarker) {
+				const int top = static_cast<int>(posY) + (std::max)(0, (static_cast<int>(name.getSize().y) - 5) / 2);
+				auto segment = [](int x, int y, unsigned width, unsigned height, SokuLib::Color fill) {
+					SokuLib::DrawUtils::RectangleShape shape;
+					shape.setPosition({x, y});
+					shape.setSize({width, height});
+					shape.setFillColor(fill);
+					shape.setBorderColor({0, 0, 0, 0});
+					shape.draw();
+				};
+				const int x = static_cast<int>(minPos) + 2;
+				// Both markers sit on the left: green points down, red points up.
+				for (int pass = 0; pass < 2; ++pass) {
+					const int shadow = pass == 0 ? 1 : 0;
+					const auto ink = pass == 0 ? SokuLib::Color{12, 18, 25, 230} : markerColor;
+					for (int line = 0; line < 5; ++line) {
+						const int inset = nameMarker > 0 ? line : 4 - line;
+						segment(x + inset + shadow, top + line + shadow, 9 - inset * 2, 1, ink);
+					}
+				}
+			}
 		}
 		this->_renderTextBubbles(this->_playersById);
 		this->_renderEmoteBubbles(this->_playersById);
@@ -2289,49 +2331,6 @@ void InLobbyMenu::_renderRelativeRatings()
 			drawCard(player.id, player, false,
 				static_cast<int>(this->_translate.x + player.pos.x * this->_zoom),
 				static_cast<int>(this->_translate.y + player.pos.y * this->_zoom));
-		if (!relativeRatingMarkers || player.id == me->id)
-			continue;
-		RelativeRatings::Rating ownRating, otherRating;
-		if (!lobbyData->relativeRatings().lookup(me->name, ownRating) || !lobbyData->relativeRatings().lookup(player.name, otherRating))
-			continue;
-		const bool easier = ownRating.value - otherRating.value >= 100;
-		const bool harder = otherRating.value - ownRating.value >= 300;
-		if (!easier && !harder)
-			continue;
-		const int x = static_cast<int>(this->_translate.x + (player.pos.x - 32) * this->_zoom);
-		const int y = static_cast<int>(this->_translate.y + (player.pos.y - 112) * this->_zoom);
-		if (x > 640 || x < -80 || y > 480 || y < -100)
-			continue;
-		const int width = static_cast<int>((std::max)(44.f, 64.f * this->_zoom));
-		const int height = static_cast<int>((std::max)(70.f, 96.f * this->_zoom));
-		auto segment = [](int left, int top, unsigned width, unsigned height, SokuLib::Color color) {
-			SokuLib::DrawUtils::RectangleShape shape;
-			shape.setPosition({left, top});
-			shape.setSize({width, height});
-			shape.setFillColor(color);
-			shape.setBorderColor(SokuLib::Color{0, 0, 0, 0});
-			shape.draw();
-		};
-		if (easier) {
-			const int footY = static_cast<int>(this->_translate.y + player.pos.y * this->_zoom) + 2;
-			const int centerX = static_cast<int>(this->_translate.x + player.pos.x * this->_zoom);
-			const int span = width * 3 / 4;
-			segment(centerX - span / 2 - 3, footY - 2, span + 6, 6, {100, 217, 176, 35});
-			segment(centerX - span / 2, footY, span, 2, {120, 230, 190, 190});
-			segment(centerX - span / 2, footY - 3, 2, 3, {120, 230, 190, 150});
-			segment(centerX + span / 2 - 2, footY - 3, 2, 3, {120, 230, 190, 150});
-		} else {
-			// Short corner brackets leave the character and name unobstructed.
-			const unsigned length = static_cast<unsigned>((std::max)(7.f, 10.f * this->_zoom));
-			for (int side = 0; side < 2; ++side) {
-				for (int edge = 0; edge < 2; ++edge) {
-					const int cornerX = x + (side ? width - 2 : 0);
-					const int cornerY = y + (edge ? height - 2 : 0);
-					segment(side ? x + width - length : x, cornerY, length, 2, {240, 128, 142, 200});
-					segment(cornerX, edge ? y + height - length : y, 2, length, {240, 128, 142, 200});
-				}
-			}
-		}
 	}
 }
 
@@ -2395,7 +2394,7 @@ void InLobbyMenu::_queuePlayerRemoval(unsigned player)
 void InLobbyMenu::_buildPlayerName(unsigned player, const std::string &name)
 {
 	constexpr int horizontalPadding = 2;
-	constexpr SokuLib::Vector2i textureSize{200, 20};
+	constexpr SokuLib::Vector2i textureSize{200, 24};
 	SokuLib::Vector2i size;
 	int texId = 0;
 	std::wstring decoded;
@@ -2407,15 +2406,19 @@ void InLobbyMenu::_buildPlayerName(unsigned player, const std::string &name)
 	}
 	auto &font = lobbyData->getFont(16);
 	auto originalOffsetX = font.description.offsetX;
+	auto originalOffsetY = font.description.offsetY;
 
 	font.description.offsetX = originalOffsetX + horizontalPadding;
-	auto created = createTextTexture(texId, decoded.c_str(), font, textureSize, &size);
+	font.description.offsetY = originalOffsetY + 1;
+	auto created = createTextTexture(texId, decoded.c_str(), font, textureSize, &size, false, true);
 	font.description.offsetX = originalOffsetX;
+	font.description.offsetY = originalOffsetY;
 	if (!created) {
 		puts("Error creating player name texture");
 		return;
 	}
 	size.x = (std::min)(textureSize.x, size.x + horizontalPadding * 2);
+	size.y = (std::min)(textureSize.y, size.y + 2);
 	auto &sprite = this->_extraPlayerData[player].name;
 	sprite.texture.setHandle(texId, textureSize.to<unsigned>());
 	sprite.setSize(size.to<unsigned>());
@@ -3019,9 +3022,10 @@ void InLobbyMenu::_inputBoxUpdate(bool blockChatInput)
 			if (down && !this->_battleChatHolding)
 				this->_battleChatHoldStarted = now;
 			this->_battleChatHolding = down;
-			if (down && now - this->_battleChatHoldStarted >= std::chrono::milliseconds(1500)) {
+			if ((battleChatHoldMs == 0 && (down || this->keysPressed[chatKey])) ||
+				(down && now - this->_battleChatHoldStarted >= std::chrono::milliseconds(battleChatHoldMs))) {
 				openBattleChat = true;
-				this->_battleChatAwaitRelease = true;
+				this->_battleChatAwaitRelease = down;
 				this->_battleChatHolding = false;
 				this->_battleChatHintUntil = {};
 			}
@@ -4231,14 +4235,15 @@ void InLobbyMenu::updateChat(bool inGame)
 void InLobbyMenu::_renderBattleChatHint()
 {
 	auto now = std::chrono::steady_clock::now();
-	if (!this->_battleChatActive || this->_editingText || now >= this->_battleChatHintUntil)
+	if (!battleChatHoldMs || !this->_battleChatActive || this->_editingText || now >= this->_battleChatHintUntil)
 		return;
 	auto elapsed = this->_battleChatHolding
 		? std::chrono::duration_cast<std::chrono::milliseconds>(now - this->_battleChatHoldStarted).count() : 0;
-	int remaining = (std::max)(1, 2 - static_cast<int>(elapsed / 1000));
+	int remaining = (std::max)(1, static_cast<int>((battleChatHoldMs - (std::min)(static_cast<long long>(battleChatHoldMs), elapsed) + 999) / 1000));
+	const auto seconds = std::to_wstring((battleChatHoldMs + 999) / 1000);
 	std::wstring text = chineseLanguage
-		? L"\u957F\u6309\u804A\u5929\u952E 2 \u79D2\u6253\u5F00\u5BF9\u8BDD\u6846"
-		: L"Hold the chat key for 2 seconds to open chat";
+		? L"\u957F\u6309\u804A\u5929\u952E " + seconds + L" \u79D2\u6253\u5F00\u5BF9\u8BDD\u6846"
+		: L"Hold the chat key for " + seconds + L" seconds to open chat";
 	text += chineseLanguage ? L"  -  \u5269\u4F59 " : L"  -  ";
 	text += std::to_wstring(remaining);
 	text += chineseLanguage ? L" \u79D2" : L"s remaining";
@@ -4277,7 +4282,7 @@ void InLobbyMenu::_renderBattleChatHint()
 		SokuLib::pd3dDev->DrawPrimitiveUP(D3DPT_TRIANGLEFAN, 2, vertices, sizeof(*vertices));
 	};
 	drawBar(472, 0xFF343E50);
-	drawBar(static_cast<unsigned>((std::min)(1500LL, elapsed) * 472 / 1500), 0xFF7FA6D9);
+	drawBar(static_cast<unsigned>((std::min)(static_cast<long long>(battleChatHoldMs), elapsed) * 472 / battleChatHoldMs), 0xFF7FA6D9);
 }
 
 void InLobbyMenu::renderChat()

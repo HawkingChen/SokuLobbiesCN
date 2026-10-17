@@ -27,7 +27,6 @@ public:
 	};
 
 private:
-	std::wstring _moduleDirectory;
 	std::wstring _cachePath;
 	std::wstring _mapPath;
 	std::wstring _caPath;
@@ -46,20 +45,12 @@ private:
 	mutable std::vector<std::string> _pendingProfiles;
 	mutable std::unordered_map<std::string, std::uint64_t> _profileChecked;
 	std::unordered_map<std::string, std::string> _profileHandles;
-	std::string _etag;
-	std::uint64_t _updatedAt = 0;
-	bool _refreshRequested = true;
-	std::string _status = "Not loaded";
 
 	void _run();
 	void _debugLog(const std::string &message) const;
-	bool _loadCache();
 	void _loadMappings();
-	bool _download();
-	void _downloadProfile(const std::string &profile);
 	void _downloadProfiles(const std::vector<std::string> &profiles);
-	bool _publish(const std::string &json, std::uint64_t updatedAt);
-	void _writeCache(const std::string &json, std::uint64_t updatedAt);
+	bool _publish(const std::string &json);
 
 public:
 	explicit RelativeRatings(const std::wstring &moduleDirectory);
@@ -69,9 +60,7 @@ public:
 
 	void setEnabled(bool enabled);
 	void stop();
-	void refresh();
 	bool setMapping(const std::string &profile, const std::string &account);
 	bool lookup(const std::string &profile, Rating &rating) const;
 	bool hasData() const;
-	std::string status() const;
 };

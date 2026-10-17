@@ -190,7 +190,8 @@ if ("${CMAKE_CXX_COMPILER_ID}" STREQUAL "MSVC")
 	)
 	target_compile_options(SokuLobbiesMod PRIVATE /Zi /utf-8)
 	target_compile_definitions("SokuLobbiesMod" PRIVATE DIRECTINPUT_VERSION=0x0800 _CRT_SECURE_NO_WARNINGS)
-	target_compile_definitions(SokuLobbiesMod PRIVATE $<$<CONFIG:Debug>:SOKU_RATINGS_DIAGNOSTICS=1>)
+	option(SOKU_RATINGS_DIAGNOSTICS "Enable player rating diagnostic logs in any build configuration" OFF)
+	target_compile_definitions(SokuLobbiesMod PRIVATE $<$<OR:$<CONFIG:Debug>,$<BOOL:${SOKU_RATINGS_DIAGNOSTICS}>>:SOKU_RATINGS_DIAGNOSTICS=1>)
 	target_link_libraries(
 		SokuLobbiesMod
 		SokuLib

@@ -12,14 +12,11 @@
 #include <iomanip>
 #include <limits>
 #include <sstream>
-#include <string_view>
 #include <unordered_set>
 
 namespace {
 	using Json = nlohmann::json;
 	constexpr std::size_t maxResponseSize = 12u * 1024u * 1024u;
-	constexpr auto refreshInterval = std::chrono::minutes(10);
-
 	std::uint64_t fileTimeNow()
 	{
 		FILETIME value{};
@@ -38,7 +35,6 @@ namespace {
 
 	struct DownloadBuffer {
 		std::string body;
-		std::string etag;
 		std::atomic_bool *enabled = nullptr;
 		std::atomic_bool *stopping = nullptr;
 	};
@@ -52,21 +48,6 @@ namespace {
 		if (bytes > maxResponseSize - buffer->body.size())
 			return 0;
 		buffer->body.append(data, bytes);
-		return bytes;
-	}
-
-	size_t receiveHeader(char *data, size_t size, size_t count, void *context)
-	{
-		if (size && count > (std::numeric_limits<size_t>::max)() / size)
-			return 0;
-		size_t bytes = size * count;
-		auto *buffer = static_cast<DownloadBuffer *>(context);
-		std::string_view line(data, bytes);
-		if (line.size() >= 5 && _strnicmp(line.data(), "ETag:", 5) == 0) {
-			buffer->etag = trim(std::string(line.substr(5)));
-			if (buffer->etag.find_first_of("\r\n") != std::string::npos)
-				buffer->etag.clear();
-		}
 		return bytes;
 	}
 
@@ -99,7 +80,6 @@ namespace {
 }
 
 RelativeRatings::RelativeRatings(const std::wstring &moduleDirectory) :
-	_moduleDirectory(moduleDirectory),
 	_cachePath((std::filesystem::path(moduleDirectory) / L"ratings-cache").wstring()),
 	_mapPath((std::filesystem::path(moduleDirectory) / L"ratings-map.tsv").wstring()),
 	_caPath((std::filesystem::path(moduleDirectory) / L"assets/ratings/curl-ca-bundle.crt").wstring()),
@@ -149,15 +129,6 @@ void RelativeRatings::stop()
 	_wake.notify_all();
 	if (_worker.joinable())
 		_worker.join();
-}
-
-void RelativeRatings::refresh()
-{
-	{
-		std::lock_guard<std::mutex> lock(_mutex);
-		_refreshRequested = true;
-	}
-	_wake.notify_all();
 }
 
 bool RelativeRatings::setMapping(const std::string &profile, const std::string &account)
@@ -260,12 +231,6 @@ bool RelativeRatings::lookup(const std::string &profile, Rating &rating) const
 	return true;
 }
 
-std::string RelativeRatings::status() const
-{
-	std::lock_guard<std::mutex> lock(_mutex);
-	return _status;
-}
-
 bool RelativeRatings::hasData() const
 {
 	std::lock_guard<std::mutex> lock(_mutex);
@@ -292,7 +257,7 @@ void RelativeRatings::_loadMappings()
 	_manualAccounts.swap(mappings);
 }
 
-bool RelativeRatings::_publish(const std::string &text, std::uint64_t updatedAt)
+bool RelativeRatings::_publish(const std::string &text)
 {
 	try {
 		Json root = Json::parse(text);
@@ -371,232 +336,10 @@ bool RelativeRatings::_publish(const std::string &text, std::uint64_t updatedAt)
 				auto found = _byName.find(name);
 				if (found != _byName.end()) _byQuery.insert_or_assign(query, found->second);
 			}
-		_updatedAt = updatedAt;
-		_status = "Loaded";
 		return true;
 	} catch (...) {
 		return false;
 	}
-}
-
-bool RelativeRatings::_loadCache()
-{
-	try {
-		std::ifstream file(_cachePath, std::ios::binary | std::ios::ate);
-		if (!file)
-			return false;
-		auto length = file.tellg();
-		if (length <= 0 || static_cast<std::uint64_t>(length) > maxResponseSize)
-			return false;
-		std::string json(static_cast<std::size_t>(length), '\0');
-		file.seekg(0);
-		file.read(json.data(), static_cast<std::streamsize>(length));
-		if (!file)
-			return false;
-		return _publish(json, cacheTime(_cachePath));
-	} catch (...) {
-		return false;
-	}
-}
-
-void RelativeRatings::_writeCache(const std::string &json, std::uint64_t)
-{
-	auto tempPath = _cachePath + L".tmp";
-	try {
-		{
-			std::ofstream file(tempPath, std::ios::binary | std::ios::trunc);
-			file.write(json.data(), static_cast<std::streamsize>(json.size()));
-			if (!file)
-				return;
-		}
-		if (!MoveFileExW(tempPath.c_str(), _cachePath.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
-			DeleteFileW(tempPath.c_str());
-	} catch (...) {
-		DeleteFileW(tempPath.c_str());
-	}
-}
-
-bool RelativeRatings::_download()
-{
-	CURL *curl = curl_easy_init();
-	if (!curl) {
-		std::lock_guard<std::mutex> lock(_mutex);
-		_status = "Unable to initialize HTTPS";
-		return false;
-	}
-	DownloadBuffer response{{}, {}, &_enabled, &_stopping};
-	struct curl_slist *headers = nullptr;
-	std::string etag;
-	{
-		std::lock_guard<std::mutex> lock(_mutex);
-		etag = _etag;
-	}
-	if (!etag.empty())
-		headers = curl_slist_append(nullptr, ("If-None-Match: " + etag).c_str());
-	curl_easy_setopt(curl, CURLOPT_URL, "https://soku.cleista.cc/api/v1/ratings/export.json");
-	curl_easy_setopt(curl, CURLOPT_PROTOCOLS, CURLPROTO_HTTPS);
-	curl_easy_setopt(curl, CURLOPT_REDIR_PROTOCOLS, CURLPROTO_HTTPS);
-	curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
-	curl_easy_setopt(curl, CURLOPT_MAXREDIRS, 5L);
-	curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 10L);
-	curl_easy_setopt(curl, CURLOPT_TIMEOUT, 25L);
-	curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
-	curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
-	curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 2L);
-	curl_easy_setopt(curl, CURLOPT_CAINFO, std::filesystem::path(_caPath).string().c_str());
-	curl_easy_setopt(curl, CURLOPT_USERAGENT, "SokuLobbies-RelativeRatings/1.0");
-	curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, receiveBody);
-	curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
-	curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, receiveHeader);
-	curl_easy_setopt(curl, CURLOPT_HEADERDATA, &response);
-	curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
-	curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, transferProgress);
-	curl_easy_setopt(curl, CURLOPT_XFERINFODATA, &response);
-	if (headers)
-		curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
-	CURLcode result = curl_easy_perform(curl);
-	long statusCode = 0;
-	curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &statusCode);
-	curl_easy_cleanup(curl);
-	curl_slist_free_all(headers);
-	if (result == CURLE_OK && statusCode == 304) {
-		std::lock_guard<std::mutex> lock(_mutex);
-		_updatedAt = fileTimeNow();
-		_status = "Up to date";
-		return true;
-	}
-	if (result != CURLE_OK || statusCode < 200 || statusCode >= 300 || response.body.empty()) {
-		std::lock_guard<std::mutex> lock(_mutex);
-		_status = result == CURLE_OK ? "Refresh failed: HTTP " + std::to_string(statusCode) :
-			std::string("Refresh failed: ") + curl_easy_strerror(result);
-		return false;
-	}
-	const auto now = fileTimeNow();
-	if (!_publish(response.body, now)) {
-		std::lock_guard<std::mutex> lock(_mutex);
-		_status = "Invalid ratings data";
-		return false;
-	}
-	{
-		std::lock_guard<std::mutex> lock(_mutex);
-		_etag = std::move(response.etag);
-	}
-	_writeCache(response.body, now);
-	return true;
-}
-
-void RelativeRatings::_downloadProfile(const std::string &profile)
-{
-	std::error_code fsError;
-	std::filesystem::create_directories(_cachePath, fsError);
-	std::ostringstream cacheName;
-	cacheName << std::hex << std::setw(16) << std::setfill('0') << std::hash<std::string>{}(profile) << ".json";
-	const auto cacheFile = std::filesystem::path(_cachePath) / cacheName.str();
-	const auto cachedAt = cacheTime(cacheFile);
-	if (cachedAt) {
-		try {
-			std::ifstream file(cacheFile, std::ios::binary | std::ios::ate);
-			const auto length = file.tellg();
-			if (file && length > 0 && static_cast<std::uint64_t>(length) <= 64u * 1024u) {
-				std::string cached(static_cast<std::size_t>(length), '\0');
-				file.seekg(0);
-				file.read(cached.data(), static_cast<std::streamsize>(length));
-				if (file && _publish(cached, cachedAt)) {
-					auto root = Json::parse(cached);
-					const auto handle = optionalString(root["players"][0], "handle");
-					std::lock_guard<std::mutex> lock(_mutex);
-					_profileChecked[profile] = cachedAt;
-					if (!handle.empty()) _profileHandles[profile] = handle;
-				}
-			}
-		} catch (...) {}
-		constexpr std::uint64_t tenMinutes = 6000000000ULL;
-		if (fileTimeNow() >= cachedAt && fileTimeNow() - cachedAt < tenMinutes)
-			return;
-	}
-
-	auto escapeQuery = [](const std::string &value) {
-		CURL *curl = curl_easy_init();
-		if (!curl) return std::string{};
-		char *escaped = curl_easy_escape(curl, value.c_str(), static_cast<int>(value.size()));
-		std::string result = escaped ? escaped : "";
-		curl_free(escaped);
-		curl_easy_cleanup(curl);
-		return result;
-	};
-	auto fetch = [&](const std::string &url, std::string &body) {
-		CURL *curl = curl_easy_init();
-		if (!curl) return false;
-		DownloadBuffer response{{}, {}, &_enabled, &_stopping};
-		const auto caPath = std::filesystem::path(_caPath).string();
-		curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
-		curl_easy_setopt(curl, CURLOPT_PROTOCOLS, CURLPROTO_HTTPS);
-		curl_easy_setopt(curl, CURLOPT_REDIR_PROTOCOLS, CURLPROTO_HTTPS);
-		curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
-		curl_easy_setopt(curl, CURLOPT_MAXREDIRS, 5L);
-		curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 6L);
-		curl_easy_setopt(curl, CURLOPT_TIMEOUT, 12L);
-		curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
-		curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
-		curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 2L);
-		curl_easy_setopt(curl, CURLOPT_CAINFO, caPath.c_str());
-		curl_easy_setopt(curl, CURLOPT_USERAGENT, "SokuLobbies-RelativeRatings/1.0");
-		curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, receiveBody);
-		curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
-		curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
-		curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, transferProgress);
-		curl_easy_setopt(curl, CURLOPT_XFERINFODATA, &response);
-		const auto result = curl_easy_perform(curl);
-		long code = 0;
-		curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &code);
-		curl_easy_cleanup(curl);
-		if (result != CURLE_OK || code != 200) return false;
-		body = std::move(response.body);
-		return !body.empty();
-	};
-	const auto base = std::string("https://soku.cleista.cc/api/v1/ratings/players?name=");
-	const auto query = escapeQuery(profile);
-	std::string body;
-	if (!query.empty()) fetch(base + query, body);
-	bool found = false;
-	try {
-		auto root = Json::parse(body);
-		found = root.contains("players") && root["players"].is_array() && !root["players"].empty();
-	} catch (...) {}
-	if (!found) {
-		std::string mapped;
-		const auto encoded = escapeQuery(profile);
-		if (!encoded.empty()) fetch("https://soku.cleista.cc/api/names/profiles?name=" + encoded, mapped);
-		std::string handle;
-		try {
-			auto root = Json::parse(mapped);
-			auto item = root.find(profile);
-			if (item != root.end() && item->is_object()) handle = optionalString(*item, "handle");
-		} catch (...) {}
-		if (!handle.empty()) {
-			const auto encodedHandle = escapeQuery("@" + handle);
-			body.clear();
-			if (!encodedHandle.empty()) fetch(base + encodedHandle, body);
-		}
-	}
-	try {
-		auto root = Json::parse(body);
-		if (root.contains("players") && root["players"].is_array() && !root["players"].empty() && _publish(body, fileTimeNow())) {
-			const auto handle = optionalString(root["players"][0], "handle");
-			{
-				std::lock_guard<std::mutex> lock(_mutex);
-				_profileChecked[profile] = fileTimeNow();
-				if (!handle.empty()) _profileHandles[profile] = handle;
-				_status = "Loaded current lobby players";
-			}
-			std::ofstream file(cacheFile, std::ios::binary | std::ios::trunc);
-			file.write(body.data(), static_cast<std::streamsize>(body.size()));
-			return;
-		}
-	} catch (...) {}
-	// A failed lookup can be retried after one minute.
-	std::lock_guard<std::mutex> lock(_mutex);
-	_profileChecked[profile] = fileTimeNow() - 35400000000ULL;
 }
 
 void RelativeRatings::_downloadProfiles(const std::vector<std::string> &profiles)
@@ -620,7 +363,7 @@ void RelativeRatings::_downloadProfiles(const std::vector<std::string> &profiles
 					std::string json(static_cast<std::size_t>(length), '\0');
 					file.seekg(0);
 					file.read(json.data(), static_cast<std::streamsize>(length));
-					if (file) _publish(json, written);
+					if (file) _publish(json);
 				}
 			} catch (...) {}
 		}
@@ -642,7 +385,7 @@ void RelativeRatings::_downloadProfiles(const std::vector<std::string> &profiles
 			lastFetchInfo = label + " curl init failed";
 			return false;
 		}
-		DownloadBuffer response{{}, {}, &_enabled, &_stopping};
+		DownloadBuffer response{{}, &_enabled, &_stopping};
 		curl_slist *headers = nullptr;
 		if (postBody) headers = curl_slist_append(headers, "Content-Type: application/json");
 		char errorBuffer[CURL_ERROR_SIZE]{};
@@ -696,12 +439,11 @@ void RelativeRatings::_downloadProfiles(const std::vector<std::string> &profiles
 		_debugLog("batch request failed: " + lastFetchInfo + " ca_bundle_exists=" +
 			(std::filesystem::exists(_caPath) ? "true" : "false"));
 		std::lock_guard<std::mutex> lock(_mutex);
-		_status = "Ratings lookup failed";
 		for (const auto &name : pending) _profileChecked[name] = fileTimeNow() - 5400000000ULL;
 		return;
 	}
 	const auto now = fileTimeNow();
-	const bool published = _publish(body, now);
+	const bool published = _publish(body);
 	std::unordered_set<std::string> foundNames;
 	std::vector<std::pair<std::string, std::string>> aliases;
 	std::size_t responseRecords = 0;
@@ -751,7 +493,7 @@ void RelativeRatings::_downloadProfiles(const std::vector<std::string> &profiles
 		for (const auto &alias : aliases) handles.push_back("@" + alias.second);
 		std::string handleBody;
 		if (queryBatch(handles, handleBody)) {
-			const bool handlePublished = _publish(handleBody, now);
+			const bool handlePublished = _publish(handleBody);
 			_debugLog("handle batch response: " + lastFetchInfo + " published=" + (handlePublished ? "true" : "false"));
 			try {
 				auto root = Json::parse(handleBody);

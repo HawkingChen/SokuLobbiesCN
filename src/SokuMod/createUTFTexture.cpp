@@ -175,7 +175,7 @@ static bool isD3D9ExDevice()
 	return SUCCEEDED(result);
 }
 
-bool createTextTexture(int &retId, const wchar_t* text, SokuLib::SWRFont& font, SokuLib::Vector2i texsize, SokuLib::Vector2i *size, bool sharp)
+bool createTextTexture(int &retId, const wchar_t* text, SokuLib::SWRFont& font, SokuLib::Vector2i texsize, SokuLib::Vector2i *size, bool sharp, bool outline)
 {
 	auto strSize = wcslen(text);
 	LPDIRECT3DTEXTURE9 *texPtr = SokuLib::textureMgr.allocate(&retId);
@@ -312,11 +312,30 @@ bool createTextTexture(int &retId, const wchar_t* text, SokuLib::SWRFont& font, 
 			if (color) {
 				auto mean = (color.r + color.g + color.b) / 3;
 
-				(font.description.shadow ? ptr2 + y * inputLineSize : ptr1 + y * outputLineSize)[x] = SokuLib::Color{0xFF, 0xFF, 0xFF, static_cast<unsigned char>(mean)};
+				(font.description.shadow || outline ? ptr2 + y * inputLineSize : ptr1 + y * outputLineSize)[x] = SokuLib::Color{0xFF, 0xFF, 0xFF, static_cast<unsigned char>(mean)};
 			}
 		}
 	}
-	if (font.description.shadow)
+	if (outline) {
+		// Bake an eight-neighbour, one-pixel black outline into the texture.
+		// Preserve antialiasing and straight alpha so tint changes only the glyph.
+		for (int y = 0; y < texsize.y; ++y) {
+			for (int x = 0; x < texsize.x; ++x) {
+				const unsigned glyph = ptr2[y * inputLineSize + x].a;
+				unsigned edge = glyph;
+				for (int dy = -1; dy <= 1; ++dy) {
+					if (y + dy < 0 || y + dy >= texsize.y) continue;
+					for (int dx = -1; dx <= 1; ++dx) {
+						if (x + dx < 0 || x + dx >= texsize.x) continue;
+						edge = (std::max)(edge, static_cast<unsigned>(ptr2[(y + dy) * inputLineSize + x + dx].a));
+					}
+				}
+				const unsigned alpha = glyph + _div255(edge * (255 - glyph));
+				const auto ink = static_cast<unsigned char>(alpha ? glyph * 255 / alpha : 0);
+				ptr1[y * outputLineSize + x] = SokuLib::Color{ink, ink, ink, static_cast<unsigned char>(alpha)};
+			}
+		}
+	} else if (font.description.shadow)
 		repl_textShadow(texsize.y, texsize.x, inputLineSize, outputLineSize, reinterpret_cast<unsigned *>(r2.pBits), reinterpret_cast<unsigned *>(r1.pBits));
 	texPtr2->UnlockRect(0);
 	outputTexture->UnlockRect(0);
