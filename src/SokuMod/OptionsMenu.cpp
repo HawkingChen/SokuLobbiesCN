@@ -145,7 +145,8 @@ std::wstring localizedOptionName(const std::string &name)
 		{"Max Chat Messages", L"\u6700\u5927\u804A\u5929\u8BB0\u5F55"}, {"Chat Key", L"\u804A\u5929\u6846\u6309\u952E"}, {"Opponent Chat Color", L"\u5BF9\u624B\u804A\u5929\u989C\u8272"},
 		{"Host IP", L"\u5BF9\u6218 IP"}, {"Chat Logs", L"\u804A\u5929\u65E5\u5FD7"}, {"Reset Config", L"\u91CD\u7F6E\u914D\u7F6E"}, {"Quick Messages", L"\u5FEB\u6377\u5BF9\u8BDD"},
 		{"Rating Settings", L"\u7B49\u7EA7\u5206\u8BBE\u7F6E"},
-		{"Battle Chat Hold", L"\u5BF9\u5C40\u804A\u5929\u957F\u6309"}
+		{"Battle Chat Hold", L"\u5BF9\u5C40\u804A\u5929\u957F\u6309"},
+		{"Own Chat Color", L"\u81EA\u5DF1\u804A\u5929\u989C\u8272"}
 	};
 	auto found = labels.find(name);
 	return found == labels.end() ? std::wstring(name.begin(), name.end()) : found->second;
@@ -162,7 +163,7 @@ std::wstring localizedChoice(const std::string &label)
 		{"Open Folder", L"\u6253\u5F00\u6587\u4EF6\u5939"}, {"Restore Defaults", L"\u6062\u590D\u9ED8\u8BA4\u914D\u7F6E"}, {"Edit 1-9", L"\u7F16\u8F91 1-9"},
 		{"Settings", L"\u8BBE\u7F6E"}, {"Automatic", L"\u81EA\u52A8"}, {"Manual (F8)", L"\u624B\u52A8 (F8)"}, {"Off", L"\u5173\u95ED"},
 		{"Above", L"\u5934\u4E0A"}, {"Center", L"\u8EAB\u4E0A"}, {"Right", L"\u53F3\u4FA7"}, {"Open Mapping", L"\u7F16\u8F91\u8D26\u53F7\u6620\u5C04"}, {"Refresh Now", L"\u7ACB\u5373\u5237\u65B0"},
-		{"Enter", L"\u56DE\u8F66"}, {"Space", L"\u7A7A\u683C"}, {"Instant", L"\u76F4\u63A5\u6253\u5F00"}
+		{"Enter", L"\u56DE\u8F66"}, {"Space", L"\u7A7A\u683C"}, {"Instant", L"\u76F4\u63A5\u6253\u5F00"}, {"Bright Green", L"\u4EAE\u7EFF"}
 	};
 	auto found = labels.find(label);
 	return found == labels.end() ? std::wstring(label.begin(), label.end()) : found->second;
@@ -350,6 +351,20 @@ OptionsMenu::OptionsMenu(LobbyMenu *parent) :
 		colorValue
 	});
 	this->_addOption({
+		"Own Chat Color",
+		{{"Bright Green", 0x90EE90}, {"Soft Green", 0x79B88A}, {"Soft Blue", 0x7FA6D9}, {"Gold", 0xE0B85C}, {"Soft Pink", 0xD990B5}, {"Orange", 0xD98B5F}, {"Purple", 0xFF00FF}, {"White", 0xFFFFFF}},
+		[] { return ownChatColor & 0xFFFFFF; },
+		[](unsigned value) {
+			wchar_t buffer[7];
+			std::swprintf(buffer, 7, L"%06X", value & 0xFFFFFF);
+			if (!saveString(L"OwnChatColor", buffer))
+				return false;
+			ownChatColor = value & 0xFFFFFF;
+			return true;
+		},
+		colorValue
+	});
+	this->_addOption({
 		"Host IP",
 		{{hostIpLabel(readLobbyString(L"HostIP")), 0}},
 		[] { return 0u; },
@@ -465,6 +480,7 @@ OptionsMenu::OptionsMenu(LobbyMenu *parent) :
 			if (name == "Quick Messages") return 2;
 			if (name == "Rating Settings") return 3;
 			if (name == "Opponent Chat Color") return 4;
+			if (name == "Own Chat Color") return 4;
 			if (name == "Chat Key") return 5;
 			if (name == "Battle Chat Hold") return 5;
 			if (name == "Host IP") return 6;
@@ -908,13 +924,13 @@ int OptionsMenu::onRender()
 	this->_title.draw();
 	for (unsigned i = 0; i < this->_options.size(); i++) {
 		auto &option = this->_options[i];
-		int y = 106 + static_cast<int>(i) * 24;
+		int y = 106 + static_cast<int>(i) * 22;
 		option.labelSprite.setPosition({64, y});
 		option.valueSprite.setPosition({560 - static_cast<int>(option.valueSprite.getSize().x), y});
 		option.labelSprite.draw();
 		option.valueSprite.draw();
 	}
-	displayTranslucentCursor({50, 102 + static_cast<int>(this->_cursor) * 24}, {526, 22});
+	displayTranslucentCursor({50, 102 + static_cast<int>(this->_cursor) * 22}, {526, 22});
 	if (this->_statusTimer)
 		this->_status.draw();
 	else

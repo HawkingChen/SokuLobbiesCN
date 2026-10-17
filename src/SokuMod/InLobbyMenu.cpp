@@ -761,6 +761,9 @@ InLobbyMenu::InLobbyMenu(LobbyMenu *menu, SokuLib::MenuConnect *parent, std::sha
 				}
 			}
 		}
+		const auto me = this->_connection->getMe();
+		if (me && player > 0 && static_cast<uint32_t>(player) == me->id)
+			colorOverride = ownChatColor;
 		bool autoPopup = chatPopupMode == CHAT_POPUP_ALL || (chatPopupMode == CHAT_POPUP_OPPONENTS && opponentMessage);
 		const bool inBattle =
 			SokuLib::sceneId == SokuLib::SCENE_BATTLECL ||
@@ -2278,7 +2281,10 @@ void InLobbyMenu::_renderRelativeRatings()
 		}
 		const int characterRows = (std::max)(0, static_cast<int>(card.lines.size()) - 2);
 		const int height = characterRows ? 58 + characterRows * 18 : 52;
-		const int width = 208;
+		int width = 120;
+		for (const auto &line : card.lines)
+			width = (std::max)(width, static_cast<int>(line.getSize().x) + 18);
+		width = (std::min)(width, 208);
 		int x = own ? 8 : anchorX - width / 2 + relativeRatingOffsetX;
 		int y = own ? 8 : anchorY - height - 52 + relativeRatingOffsetY;
 		if (!own && relativeRatingPosition == 1)

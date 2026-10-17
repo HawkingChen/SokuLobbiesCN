@@ -326,6 +326,7 @@ unsigned lobbyJoinTries;
 unsigned lobbyJoinInterval;
 unsigned maxChatMessages;
 unsigned opponentChatColor = 0x7FA6D9;
+unsigned ownChatColor = 0x90EE90;
 bool showTextBubbles = true;
 bool relativeRatingsEnabled = false;
 unsigned relativeRatingMode = 0;
@@ -1446,17 +1447,22 @@ extern "C" __declspec(dllexport) bool Initialize(HMODULE hMyModule, HMODULE hPar
 			chatPopupMode = CHAT_POPUP_ALL;
 	}
 	{
-		wchar_t colorBuffer[32];
-		GetPrivateProfileStringW(L"Lobby", L"OpponentChatColor", L"7FA6D9", colorBuffer, sizeof(colorBuffer) / sizeof(*colorBuffer), profilePath);
-		std::wstring color{colorBuffer};
-		color.erase(color.begin(), std::find_if(color.begin(), color.end(), [](wchar_t c){ return !std::iswspace(c); }));
-		color.erase(std::find_if(color.rbegin(), color.rend(), [](wchar_t c){ return !std::iswspace(c); }).base(), color.end());
-		if (!color.empty() && color.front() == L'#')
-			color.erase(color.begin());
-		else if (color.size() >= 2 && color[0] == L'0' && (color[1] == L'x' || color[1] == L'X'))
-			color.erase(0, 2);
-		if (color.size() == 6 && std::all_of(color.begin(), color.end(), [](wchar_t c){ return std::iswxdigit(c) != 0; }))
-			opponentChatColor = std::wcstoul(color.c_str(), nullptr, 16);
+		auto readChatColor = [](const wchar_t *key, const wchar_t *defaultValue, unsigned fallback) {
+			wchar_t colorBuffer[32];
+			GetPrivateProfileStringW(L"Lobby", key, defaultValue, colorBuffer, sizeof(colorBuffer) / sizeof(*colorBuffer), profilePath);
+			std::wstring color{colorBuffer};
+			color.erase(color.begin(), std::find_if(color.begin(), color.end(), [](wchar_t c){ return !std::iswspace(c); }));
+			color.erase(std::find_if(color.rbegin(), color.rend(), [](wchar_t c){ return !std::iswspace(c); }).base(), color.end());
+			if (!color.empty() && color.front() == L'#')
+				color.erase(color.begin());
+			else if (color.size() >= 2 && color[0] == L'0' && (color[1] == L'x' || color[1] == L'X'))
+				color.erase(0, 2);
+			if (color.size() == 6 && std::all_of(color.begin(), color.end(), [](wchar_t c){ return std::iswxdigit(c) != 0; }))
+				return static_cast<unsigned>(std::wcstoul(color.c_str(), nullptr, 16));
+			return fallback;
+		};
+		opponentChatColor = readChatColor(L"OpponentChatColor", L"7FA6D9", 0x7FA6D9);
+		ownChatColor = readChatColor(L"OwnChatColor", L"90EE90", 0x90EE90);
 	}
 	lobbyJoinTries += !lobbyJoinTries;
 	lobbyJoinInterval += !lobbyJoinInterval;

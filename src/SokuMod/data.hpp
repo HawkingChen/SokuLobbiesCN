@@ -36,6 +36,7 @@ extern unsigned lobbyJoinTries;
 extern unsigned lobbyJoinInterval;
 extern unsigned maxChatMessages;
 extern unsigned opponentChatColor;
+extern unsigned ownChatColor;
 extern bool showTextBubbles;
 extern bool relativeRatingsEnabled;
 extern unsigned relativeRatingMode;
