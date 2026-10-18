@@ -7,12 +7,14 @@
 #include "Exceptions.hpp"
 #include <cstring>
 #include <sstream>
+#include <memory>
 
 #ifndef _WIN32
 #include <unistd.h>
 #include <netdb.h>
 #include <arpa/inet.h>
 #include <sys/select.h>
+#include <fcntl.h>
 typedef fd_set FD_SET;
 #else
 #define socklen_t int
@@ -58,6 +60,52 @@ Socket::Socket() {
 
 Socket::~Socket() {
 	Socket::disconnect();
+}
+
+void Socket::connectWithTimeout(const std::string &host, unsigned short portno, std::chrono::milliseconds timeout, const std::atomic_bool &running) {
+	if (!running) return;
+	if (isOpen()) throw AlreadyOpenedException("This socket is already opened");
+	const auto resolved = gethostbyname(host.c_str());
+	if (!resolved || resolved->h_addrtype != AF_INET || resolved->h_length != sizeof(in_addr))
+		throw HostNotFoundException("Cannot find host '" + host + "'");
+	sockaddr_in address{}; address.sin_family = AF_INET; address.sin_port = htons(portno);
+	std::memcpy(&address.sin_addr, resolved->h_addr_list[0], sizeof(address.sin_addr));
+	if (!running) return;
+	const auto fd = socket(AF_INET, SOCK_STREAM, 0);
+	if (fd == INVALID_SOCKET) throw SocketCreationErrorException(getLastSocketError());
+	try {
+#ifdef _WIN32
+		u_long nonblocking = 1;
+		if (ioctlsocket(fd, FIONBIO, &nonblocking) != 0) throw ConnectException(getLastSocketError());
+#else
+		if (fcntl(fd, F_SETFL, fcntl(fd, F_GETFL, 0) | O_NONBLOCK) < 0) throw ConnectException(getLastSocketError());
+#endif
+		if (::connect(fd, reinterpret_cast<sockaddr *>(&address), sizeof(address)) != 0) {
+#ifdef _WIN32
+			if (WSAGetLastError() != WSAEWOULDBLOCK) throw ConnectException(getLastSocketError());
+#else
+			if (errno != EINPROGRESS) throw ConnectException(getLastSocketError());
+#endif
+			const auto deadline = std::chrono::steady_clock::now() + timeout;
+			while (running) {
+				if (std::chrono::steady_clock::now() >= deadline) throw ConnectException("Connection timed out");
+				fd_set writes, errors; FD_ZERO(&writes); FD_ZERO(&errors); FD_SET(fd, &writes); FD_SET(fd, &errors);
+				timeval wait{0, 50000};
+				const auto ready = select(static_cast<int>(fd + 1), nullptr, &writes, &errors, &wait);
+				if (ready < 0) throw ConnectException(getLastSocketError());
+				if (ready) {
+					int error = 0; socklen_t length = sizeof(error);
+					if (getsockopt(fd, SOL_SOCKET, SO_ERROR, reinterpret_cast<char *>(&error), &length) != 0)
+						throw ConnectException(getLastSocketError());
+					if (error) throw ConnectException(getLastSocketError(error));
+					break;
+				}
+			}
+		}
+		if (!running) { close(fd); return; }
+		_remote = address;
+		_sockfd = fd; _opened = true;
+	} catch (...) { close(fd); throw; }
 }
 
 void Socket::connect(const std::string &host, unsigned short portno) {
@@ -112,12 +160,10 @@ Socket::HttpResponse Socket::makeHttpRequest(const Socket::HttpRequest &request)
 }
 
 void Socket::disconnect() {
-	if (this->_sockfd == INVALID_SOCKET)
-		return;
-	auto sockfd = this->_sockfd;
-
-	this->_sockfd = INVALID_SOCKET;
+	const auto sockfd = this->_sockfd.exchange(INVALID_SOCKET);
 	this->_opened = false;
+	if (sockfd == INVALID_SOCKET)
+		return;
 	if (this->_noDestroy)
 		return;
 #ifdef _WIN32
@@ -232,12 +278,12 @@ std::string Socket::readUntilEOF() {
 }
 
 bool Socket::isOpen() const {
-	FD_SET set;
-	timeval time = {0, 0};
-
-	FD_ZERO(&set);
-	FD_SET(this->_sockfd, &set);
-	if (this->_opened && select(this->_sockfd + 1, &set, nullptr, nullptr, &time) == -1)
+	const auto fd = _sockfd.load();
+	if (!this->_opened || fd == INVALID_SOCKET) return false;
+	// Validate the handle without FD_SET(-1), fd_set bounds, or consuming SO_ERROR.
+	int type = 0;
+	socklen_t length = sizeof(type);
+	if (getsockopt(fd, SOL_SOCKET, SO_TYPE, reinterpret_cast<char *>(&type), &length) != 0 && _sockfd == fd)
 		this->_opened = false;
 	return (this->_opened);
 }

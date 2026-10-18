@@ -8,6 +8,7 @@
 std::mutex logMutex;
 #endif
 #include <cstring>
+#include <array>
 #include <algorithm>
 #include <chrono>
 #include <vector>
@@ -23,6 +24,7 @@ extern unsigned char soku2Major;
 extern unsigned char soku2Minor;
 extern char soku2Letter;
 extern bool soku2Force;
+extern bool chineseLanguage;
 
 static long long steadyClockMilliseconds()
 {
@@ -31,65 +33,62 @@ static long long steadyClockMilliseconds()
 	).count();
 }
 
+namespace {
+	std::mutex clientRegistryMutex;
+	std::vector<std::weak_ptr<Connection>> clientRegistry;
+}
+
 void Connection::_netLoop()
 {
-	char buffer[sizeof(Lobbies::Packet) * 6];
-	size_t recvSizeAdded;
-	size_t recvSize = 0;
-
-	while (true) {
-		if (!this->_connected)
-			return;
-
-		if (!this->_hasConnected) {
-			std::this_thread::sleep_for(std::chrono::milliseconds(100));
-			continue;
+	std::array<char, sizeof(Lobbies::Packet) * 6> buffer{};
+	size_t buffered = 0;
+	while (_connected) {
+		if (!_hasConnected) { std::this_thread::sleep_for(std::chrono::milliseconds(20)); continue; }
+		const auto fd = _socket.getSockFd();
+		fd_set reads; FD_ZERO(&reads); FD_SET(fd, &reads);
+		timeval timeout{0, 50000};
+		const auto ready = select(static_cast<int>(fd + 1), &reads, nullptr, nullptr, &timeout);
+		if (!_connected) break;
+		if (!ready) continue;
+		if (ready < 0) { _failTransport(getLastSocketError()); break; }
+		const auto received = ::recv(fd, buffer.data() + buffered, static_cast<int>(buffer.size() - buffered), 0);
+		if (received < 0) {
+			if (WSAGetLastError() == WSAEWOULDBLOCK) continue;
+			_failTransport(getLastSocketError()); break;
 		}
-
-		try {
-			recvSize += (recvSizeAdded = this->_socket.read(buffer + recvSize, sizeof(buffer) - recvSize));
-		} catch (std::exception &e) {
-			if (!this->_socket.isOpen())
-				return;
-		#ifndef _LOBBYNOLOG
-			logMutex.lock();
-			std::cerr << e.what() << std::endl;
-			logMutex.unlock();
-		#endif
-			this->_init = false;
-			this->_connected = false;
-			{
-				std::lock_guard<std::mutex> meMutexGuard(this->meMutex);
-				std::lock_guard<std::mutex> playerMutexGuard(this->_playerMutex);
-				std::lock_guard<std::mutex> functionMutexGuard(this->functionMutex);
-				this->onError(e.what());
-				if (this->onDisconnect)
-					this->onDisconnect();
+		if (!received) { _failTransport("Connection closed"); break; }
+		buffered += received;
+		size_t consumed = 0;
+		while (consumed < buffered && _connected) {
+			const auto opcode = static_cast<uint8_t>(buffer[consumed]);
+			const auto length = clientPacketSize(opcode);
+			if (!length) { _failTransport("Protocol error: Invalid opcode " + std::to_string(opcode)); return; }
+			if (buffered - consumed < length) break;
+			Lobbies::Packet packet{};
+			std::memcpy(&packet, buffer.data() + consumed, length);
+			consumed += length;
+			if (opcode == Lobbies::OPCODE_PONG) {
+				// Lobby-list metadata has no UI callbacks and must remain live while hidden.
+				auto size = length; _handlePacket(packet.pong, size); continue;
 			}
-			return;
-		}
-
-		if (recvSizeAdded == 0) {
-			this->_init = false;
-			this->_connected = false;
+			uint64_t session;
 			{
-				std::lock_guard<std::mutex> meMutexGuard(this->meMutex);
-				std::lock_guard<std::mutex> playerMutexGuard(this->_playerMutex);
-				std::lock_guard<std::mutex> functionMutexGuard(this->functionMutex);
-				this->onError("Connection closed");
-				if (this->onDisconnect)
-					this->onDisconnect();
+				std::lock_guard<std::mutex> lock(_sessionMutex);
+				if (opcode == Lobbies::OPCODE_OLLEH) {
+					if (_helloSessions.empty()) { _failTransport("Protocol error: Unexpected handshake"); return; }
+					_receiveSession = _helloSessions.front(); _helloSessions.pop_front();
+				}
+				session = _receiveSession;
 			}
-			return;
+			// Authentication can reject HELLO with KICKED before any OLLEH arrives.
+			// It terminates the transport, so retain its reason across lobby epochs.
+			if (opcode == Lobbies::OPCODE_KICKED) session = _session.load();
+			if (!session || session != _session.load()) continue;
+			// Never shed server errors, private messages or blacklist control replies.
+			const bool chat = opcode == Lobbies::OPCODE_MESSAGE && packet.message.playerId != 0 && packet.message.channelId >= 0;
+			if (!_inbox.push(&packet, length, session, chat, _connected)) return;
 		}
-
-		size_t total = recvSize;
-
-		print("Handle packet. %zu bytes remain\n", recvSize);
-		while (this->_handlePacket(*reinterpret_cast<Lobbies::Packet *>(&buffer[total - recvSize]), recvSize) && recvSize != 0 && this->_connected)
-			print("Next packet. %zu bytes remain\n", recvSize);
-		print("No more packets. %zu bytes remain\n", recvSize);
-		memmove(buffer, &buffer[total - recvSize], recvSize);
+		if (consumed) { buffered -= consumed; std::memmove(buffer.data(), buffer.data() + consumed, buffered); }
 	}
 }
 
@@ -103,65 +102,201 @@ Connection::Connection(const std::string &host, unsigned short port, const Playe
 Connection::~Connection()
 {
 	this->_init = false;
-	this->_connected = false;
+	{ std::lock_guard<std::mutex> lock(_sendMutex); this->_connected = false; }
+	_inbox.wake(); _sendReady.notify_all();
 	{
 		std::lock_guard<std::mutex> meMutexGuard(this->meMutex);
 		std::lock_guard<std::mutex> playerMutexGuard(this->_playerMutex);
 		std::lock_guard<std::mutex> functionMutexGuard(this->functionMutex);
-		if (this->onDisconnect)
+		if (!this->_disconnectNotified && this->onDisconnect)
 			this->onDisconnect();
 	}
-	// Closing the socket first interrupts a pending connect/recv so joining cannot
-	// block the game thread until the operating system network timeout expires.
-	this->_socket.disconnect();
+	// Workers use nonblocking I/O and observe cancellation before the handle is closed.
 	if (this->_connectThread.joinable())
 		this->_connectThread.join();
 	if (this->_netThread.joinable())
 		this->_netThread.join();
-	if (this->_posThread.joinable())
-		this->_posThread.join();
+	if (_sendThread.joinable()) _sendThread.join();
+	_socket.disconnect();
 }
 
 void Connection::error(const std::string &msg)
 {
-	this->onError(msg);
-	this->_init = false;
-	this->_connected = false;
-	this->_socket.disconnect();
+	_failTransport(msg);
+	_inbox.clear();
+}
+
+void Connection::_failTransport(const std::string &reason)
+{
+	{ std::lock_guard<std::mutex> lock(_errorMutex); if (_transportError.empty()) _transportError = reason; }
+	{ std::lock_guard<std::mutex> lock(_sendMutex); _connected = false; }
+	_inbox.wake(); _sendReady.notify_all();
 }
 
 void Connection::startThread()
 {
+	{ std::lock_guard<std::mutex> lock(clientRegistryMutex); clientRegistry.emplace_back(shared_from_this()); }
 	this->_connectThread = std::thread([this](){
 		try {
-			this->_socket.connect(this->_host, this->_port);
-			this->_hasConnected = true;
+			this->_socket.connectWithTimeout(this->_host, this->_port, std::chrono::seconds(6), _connected);
+			{ std::lock_guard<std::mutex> lock(_sendMutex); if (_connected) this->_hasConnected = true; }
+			_sendReady.notify_all();
 		} catch (std::exception &e) {
-			std::lock_guard<std::mutex> meMutexGuard(this->meMutex);
-			std::lock_guard<std::mutex> playerMutexGuard(this->_playerMutex);
 			this->error(e.what());
 		}
 	});
 	this->_netThread = std::thread{&Connection::_netLoop, this};
+	_sendThread = std::thread(&Connection::_sendLoop, this);
 }
 
 void Connection::send(const void *packet, size_t size)
 {
-#ifndef _LOBBYNOLOG
-	logMutex.lock();
-	std::cout << "[>" << inet_ntoa(this->_socket.getRemote().sin_addr) << ":" << this->_socket.getRemote().sin_port;
-	std::cout << "] " << size << " bytes: " << reinterpret_cast<const Lobbies::Packet *>(packet)->toString() << std::endl;
-	logMutex.unlock();
-#endif
-	try {
-		this->_socket.send(packet, size);
-	} catch (std::exception &e) {
-	#ifndef _LOBBYNOLOG
-		logMutex.lock();
-		std::cerr << e.what() << std::endl;
-		logMutex.unlock();
-	#endif
+	if (!size || !_connected) return;
+	bool overflow = false;
+	{
+		std::lock_guard<std::mutex> lock(_sendMutex);
+		if (*static_cast<const uint8_t *>(packet) == Lobbies::OPCODE_POSITION && !_init) return;
+		if (*static_cast<const uint8_t *>(packet) == Lobbies::OPCODE_BATTLE_STATUS_UPDATE && size == sizeof(Lobbies::PacketBattleStatusUpdate)) {
+			std::lock_guard<std::mutex> snapshotLock(_heartbeatMutex);
+			_heartbeat.status = static_cast<const Lobbies::PacketBattleStatusUpdate *>(packet)->newStatus;
+		}
+		if (_outgoing.size() >= 1024 || size > 512 * 1024 || _outgoingBytes > 512 * 1024 - size) overflow = true;
+		else {
+			const auto bytes = static_cast<const char *>(packet);
+			_outgoing.emplace_back(std::make_shared<std::vector<char>>(bytes, bytes + size)); _outgoingBytes += size;
+		}
 	}
+	if (overflow) _failTransport("Lobby send queue limit exceeded");
+	else _sendReady.notify_one();
+}
+
+void Connection::_sendLoop()
+{
+	auto nextHeartbeat = std::chrono::steady_clock::now();
+	while (_connected) {
+		if (_init && _heartbeatReady && std::chrono::steady_clock::now() >= nextHeartbeat) {
+			_queueHeartbeat(); nextHeartbeat = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+		}
+		std::shared_ptr<std::vector<char>> frame;
+		{
+			std::unique_lock<std::mutex> lock(_sendMutex);
+			if (!_connected) break;
+			if (!_hasConnected || _outgoing.empty()) {
+				if (_init && _heartbeatReady) _sendReady.wait_until(lock, nextHeartbeat);
+				else _sendReady.wait(lock);
+				continue;
+			}
+			frame = _outgoing.front();
+		}
+		size_t offset = 0;
+		auto progress = std::chrono::steady_clock::now();
+		while (_connected && offset < frame->size()) {
+			const auto fd = _socket.getSockFd();
+			fd_set writes; FD_ZERO(&writes); FD_SET(fd, &writes); timeval timeout{0, 50000};
+			const auto ready = select(static_cast<int>(fd + 1), nullptr, &writes, nullptr, &timeout);
+			if (!_connected) break;
+			if (ready < 0) { _failTransport(getLastSocketError()); break; }
+			if (ready) {
+				const auto sent = ::send(fd, frame->data() + offset, static_cast<int>(frame->size() - offset), 0);
+				if (sent > 0) { offset += sent; progress = std::chrono::steady_clock::now(); }
+				else if (!sent || WSAGetLastError() != WSAEWOULDBLOCK) { _failTransport(getLastSocketError()); break; }
+			}
+			if (std::chrono::steady_clock::now() - progress >= std::chrono::seconds(60)) { _failTransport("Lobby send stalled"); break; }
+		}
+		if (offset == frame->size()) {
+			std::lock_guard<std::mutex> lock(_sendMutex);
+			_outgoingBytes -= frame->size(); _outgoing.pop_front();
+		}
+	}
+}
+
+void Connection::_publishHeartbeat()
+{
+	bool published = false;
+	{
+		std::lock_guard<std::mutex> lock(meMutex);
+		if (_init && _me) {
+			std::lock_guard<std::mutex> snapshotLock(_heartbeatMutex);
+			_heartbeat = Lobbies::PacketPosition{0, _me->pos.x, _me->pos.y, _me->dir, _me->battleStatus};
+			published = true;
+		}
+	}
+	if (published) {
+		std::lock_guard<std::mutex> lock(_sendMutex);
+		if (_init && !_heartbeatReady.exchange(true)) _sendReady.notify_one();
+	}
+}
+
+void Connection::_queueHeartbeat()
+{
+	bool overflow = false;
+	{
+		// Status updates and LEAVE share this ordering lock with heartbeats.
+		std::lock_guard<std::mutex> lock(_sendMutex);
+		if (!_connected || !_init || !_heartbeatReady) return;
+		std::lock_guard<std::mutex> snapshotLock(_heartbeatMutex);
+		if (_outgoing.size() >= 1024 || _outgoingBytes > 512 * 1024 - sizeof(_heartbeat)) overflow = true;
+		else {
+			const auto bytes = reinterpret_cast<const char *>(&_heartbeat);
+			_outgoing.emplace_back(std::make_shared<std::vector<char>>(bytes, bytes + sizeof(_heartbeat)));
+			_outgoingBytes += sizeof(_heartbeat);
+		}
+	}
+	if (overflow) _failTransport("Lobby send queue limit exceeded");
+	else _sendReady.notify_one();
+}
+
+void Connection::_pumpEvents(std::chrono::steady_clock::time_point deadline)
+{
+	if (_helloRequested.exchange(false) && _connected) {
+		_disconnectNotified = false; _receivedKick = false;
+		try { _sendHello(); } catch (const std::exception &e) { error(e.what()); }
+	}
+	ClientInbox::Frame frame;
+	for (unsigned i = 0; i < 16 && std::chrono::steady_clock::now() < deadline && _inbox.pop(frame); ++i) {
+		if (frame.session != _session.load()) continue;
+		Lobbies::Packet packet{}; std::memcpy(&packet, frame.bytes.data(), frame.bytes.size());
+		auto size = frame.bytes.size();
+		try { _handlePacket(packet, size); }
+		catch (const std::exception &e) { _failTransport(e.what()); _inbox.clear(); break; }
+		if (_receivedKick) { _inbox.clear(); break; }
+	}
+	if (!_connected && _inbox.empty() && !_disconnectNotified) {
+		_disconnectNotified = true; _init = false; _helloPending = false;
+		std::lock_guard<std::mutex> lock(functionMutex);
+		std::string reason;
+		{ std::lock_guard<std::mutex> errorLock(_errorMutex); reason = _transportError; }
+		if (!_receivedKick && !reason.empty() && onError) onError(reason);
+		if (onDisconnect) onDisconnect();
+	}
+	_skippedChat += _inbox.takeDropped();
+	if (_init && _skippedChat && std::chrono::steady_clock::now() - _lastChatNotice >= std::chrono::seconds(5)) {
+		std::lock_guard<std::mutex> lock(functionMutex);
+		if (onMsg) onMsg(0xAFAFAF, 0, (chineseLanguage ? "聊天消息过多，已略过部分消息：" : "Excess chat messages skipped: ") + std::to_string(_skippedChat), "");
+		_skippedChat = 0; _lastChatNotice = std::chrono::steady_clock::now();
+	}
+	_publishHeartbeat();
+}
+
+void Connection::pumpNetworkEvents()
+{
+	std::vector<std::shared_ptr<Connection>> connections;
+	{
+		std::lock_guard<std::mutex> lock(clientRegistryMutex);
+		for (auto it = clientRegistry.begin(); it != clientRegistry.end();) {
+			if (auto connection = it->lock()) { connections.push_back(std::move(connection)); ++it; }
+			else it = clientRegistry.erase(it);
+		}
+	}
+	static size_t cursor = 0;
+	const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(2);
+	for (size_t i = 0; i < connections.size() && std::chrono::steady_clock::now() < deadline; ++i) {
+		auto &connection = connections[(cursor + i) % connections.size()];
+		try { connection->_pumpEvents(deadline); }
+		catch (const std::exception &e) { connection->error(e.what()); }
+		catch (...) { connection->error("Client event handler failed"); }
+	}
+	if (!connections.empty()) cursor = (cursor + 1) % connections.size();
 }
 
 bool Connection::isInit() const
@@ -250,7 +385,7 @@ bool Connection::_handlePacket(const Lobbies::PacketOlleh &packet, size_t &size)
 	this->_players[packet.id] = player;
 	this->_me = &this->_players[packet.id];
 	this->_init = true;
-	this->_posThread = std::thread(&Connection::_posLoop, this);
+	this->_helloPending = false;
 	if (this->onConnect)
 		this->onConnect(packet);
 	return true;
@@ -334,8 +469,9 @@ bool Connection::_handlePacket(const Lobbies::PacketKicked &packet, size_t &size
 	if (!(spectatorContext && inactiveAutoKick) && this->onImpMsg)
 		this->onImpMsg("Kicked: " + reason);
 	this->_init = false;
-	this->_connected = false;
-	this->_socket.disconnect();
+	_receivedKick = true;
+	{ std::lock_guard<std::mutex> lock(_sendMutex); this->_connected = false; }
+	_inbox.wake(); _sendReady.notify_all();
 	return true;
 }
 
@@ -549,6 +685,12 @@ bool Connection::_handlePacket(const Lobbies::PacketBattleStatusUpdate &packet, 
 
 void Connection::connect()
 {
+	if (this->_init || !_connected || _helloPending.exchange(true)) return;
+	_helloRequested = true;
+}
+
+void Connection::_sendHello()
+{
 	if (this->_init)
 		return;
 
@@ -574,6 +716,10 @@ void Connection::connect()
 		*(unsigned char *)0x858B80 != *SokuLib::Soku110acNoRollSWRAllChars
 	)
 		version[0] = *(unsigned char *)0x858B80;
+	{
+		std::lock_guard<std::mutex> lock(_sessionMutex);
+		_helloSessions.push_back(_session.load());
+	}
 
 	if (this->_pwd) {
 		Lobbies::PacketHello hello{soku2Info, version, this->_initParams.name, this->_initParams.player, this->_initParams.settings, *this->_pwd};
@@ -588,12 +734,16 @@ void Connection::connect()
 
 void Connection::disconnect()
 {
-	if (!this->_init)
+	if (!this->_init && !_helloPending)
 		return;
 
 	Lobbies::PacketPlayerLeave leave{0};
 
+	// Stop heartbeat enqueueing before LEAVE; a later HELLO is a FIFO barrier.
+	{ std::lock_guard<std::mutex> lock(_sendMutex); _init = false; _heartbeatReady = false; }
 	this->send(&leave, sizeof(leave));
+	_session.fetch_add(1); _helloPending = false; _helloRequested = false; _inbox.clear();
+	_skippedChat = 0;
 	{
 		std::lock_guard<std::mutex> meMutexGuard(this->meMutex);
 		std::lock_guard<std::mutex> playerMutexGuard(this->_playerMutex);
@@ -601,15 +751,15 @@ void Connection::disconnect()
 		this->_init = false;
 		this->_me = nullptr;
 		this->_players.clear();
+		_disconnectNotified = true;
 		if (this->onDisconnect)
 			this->onDisconnect();
 	}
-	if (this->_posThread.joinable())
-		this->_posThread.join();
 }
 
 const Connection::LobbyInfo Connection::getLobbyInfo() const
 {
+	std::lock_guard<std::mutex> lock(_infoMutex);
 	return this->_info;
 }
 
@@ -705,24 +855,14 @@ void Connection::updatePlayers(const std::vector<LobbyData::Avatar> &avatars)
 	this->_playerMutex.unlock();
 }
 
-void Connection::_posLoop()
-{
-	while (this->_init) {
-		if (this->_init) {
-			this->meMutex.lock();
-			Lobbies::PacketPosition position{0, this->_me->pos.x, this->_me->pos.y, this->_me->dir, this->_me->battleStatus};
-			this->meMutex.unlock();
-
-			this->send(&position, sizeof(position));
-		}
-		for (int i = 0; i < 10 && this->_init; i++)
-			std::this_thread::sleep_for(std::chrono::milliseconds(100));
-	}
-}
-
 void Connection::setPassword(const std::string &pwd)
 {
 	this->_pwd = pwd;
+}
+
+void Connection::setInitialPlayer(const Player &player)
+{
+	if (!_init && !_helloPending) _initParams = player;
 }
 
 bool Connection::sendGameInfo()

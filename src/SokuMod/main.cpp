@@ -19,11 +19,11 @@
 #include "InputBox.hpp"
 #include "Blocklist.hpp"
 #include "integration.hpp"
+#include "Connection.hpp"
 #include "dinput.h"
 
 typedef HRESULT(__stdcall* EndSceneFn)(IDirect3DDevice9*);
 
-static void (__fastcall *og_call48AD33)(SokuLib::CharacterManager *);
 static EndSceneFn Original_EndScene;
 static bool wasBlocking = false;
 static void (*og_onUpdate)();
@@ -304,7 +304,6 @@ static void loadQuickMessages()
 }
 
 LARGE_INTEGER timer_frequency;
-unsigned &currentFrame = *(unsigned *)0x8985D8;
 unsigned char soku2Major = 0;
 unsigned char soku2Minor = 0;
 char soku2Letter = 0;
@@ -341,15 +340,11 @@ unsigned short hostPort;
 bool hasSoku2 = false;
 bool counted = false;
 bool activated = true;
-bool init = false;
 auto load = std::pair(false, false);
 #ifdef _DEBUG
 bool debug = true;
 #endif
 std::function<int ()> onGameEnd;
-std::vector<unsigned short> deck;
-std::vector<std::pair<unsigned, unsigned short>> cardsUsed;
-std::vector<std::pair<unsigned, unsigned short>> cardsBurnt;
 LobbyMenu *menu = nullptr;
 PTOP_LEVEL_EXCEPTION_FILTER oldFilter = nullptr;
 std::pair<bool, bool> selectedRandom{false, false};
@@ -416,326 +411,12 @@ LONG WINAPI UnhandledExFilter(PEXCEPTION_POINTERS ExPtr)
 	return oldFilter ? oldFilter(ExPtr) : 0;
 }
 
-static void __fastcall coinUsed(SokuLib::CharacterManager *This)
+// End-of-match accounting consumes captured scalar values only.
+void countGame(unsigned char character, bool randomSelection)
 {
-	auto &battlemgr = SokuLib::getBattleMgr();
-
-	if (!lobbyData) {
-		og_call48AD33(This);
-		return;
-	}
-	if (SokuLib::mainMode == SokuLib::BATTLE_MODE_VSSERVER && This == &battlemgr.rightCharacterManager)
-		goto ok;
-	if (SokuLib::mainMode == SokuLib::BATTLE_MODE_VSCLIENT && This == &battlemgr.leftCharacterManager)
-		goto ok;
-#ifdef _DEBUG
-	if (This == &battlemgr.leftCharacterManager)
-		goto ok;
-#endif
-	og_call48AD33(This);
-	return;
-
-ok:
-	puts("Coin used");
-	cardsUsed.emplace_back(currentFrame, 12);
-	printf("Card %i used on frame %i\n", 12, currentFrame);
-	og_call48AD33(This);
-}
-
-static void __fastcall onCardUsed(SokuLib::CharacterManager *This)
-{
-	auto &battlemgr = SokuLib::getBattleMgr();
-
-	if (!lobbyData)
-		return;
-	if (SokuLib::mainMode == SokuLib::BATTLE_MODE_VSSERVER && This == &battlemgr.rightCharacterManager)
-		goto ok;
-	if (SokuLib::mainMode == SokuLib::BATTLE_MODE_VSCLIENT && This == &battlemgr.leftCharacterManager)
-		goto ok;
-#ifdef _DEBUG
-	if (This == &battlemgr.leftCharacterManager)
-		goto ok;
-#endif
-	return;
-
-ok:
-	// Special case for Utsuho's 1SC
-	if (
-		This->characterIndex == SokuLib::CHARACTER_UTSUHO &&
-		This->objectBase.action == SokuLib::ACTION_USING_SC_ID_206 &&
-		This->objectBase.actionBlockId == 3
-	) {
-		puts("Okuu 1SC consume card");
-		cardsBurnt.emplace_back(currentFrame, This->hand[0].id);
-		return;
-	}
-
-	auto cost = max(1, This->hand[0].cost - (This->effectiveWeather == SokuLib::WEATHER_CLOUDY));
-
-	printf("Card %i used, costing %i\n", This->hand[0].id, cost);
-	for (unsigned i = 0; (!i || i < cost) && i < This->hand.size; i++) {
-		(i == 0 ? cardsUsed : cardsBurnt).emplace_back(currentFrame, This->hand[i].id);
-		printf("Card %i used%s on frame %i\n", This->hand[i].id, i == 0 ? "" : " as fuel", currentFrame);
-	}
-}
-
-void countGame()
-{
-	puts("End game");
-	if (!lobbyData)
-		return;
-#ifndef _DEBUG
-	if (SokuLib::mainMode != SokuLib::BATTLE_MODE_VSSERVER && SokuLib::mainMode != SokuLib::BATTLE_MODE_VSCLIENT)
-		return;
-#endif
-
-	auto &battle = SokuLib::getBattleMgr();
-	auto mid = SokuLib::mainMode == SokuLib::BATTLE_MODE_VSSERVER ? SokuLib::rightChar : SokuLib::leftChar;
-	auto oid = SokuLib::mainMode == SokuLib::BATTLE_MODE_VSSERVER ? SokuLib::leftChar : SokuLib::rightChar;
-	auto &chr = SokuLib::mainMode == SokuLib::BATTLE_MODE_VSSERVER ? battle.rightCharacterManager : battle.leftCharacterManager;
-
-	auto data = lobbyData->loadedCharacterStats.find(mid);
-	if (data == lobbyData->loadedCharacterStats.end()) {
-		LobbyData::CharacterStatEntry entry{0, 0, 0, 0};
-
-		lobbyData->loadedCharacterStats[mid] = entry;
-		data = lobbyData->loadedCharacterStats.find(mid);
-	}
-
-	auto dataAgainst = lobbyData->loadedCharacterStats.find(oid);
-	if (dataAgainst == lobbyData->loadedCharacterStats.end()) {
-		LobbyData::CharacterStatEntry entry{0, 0, 0, 0};
-
-		lobbyData->loadedCharacterStats[oid] = entry;
-		dataAgainst = lobbyData->loadedCharacterStats.find(oid);
-	}
-
-	auto muIt = lobbyData->loadedMatchupStats.find({mid, oid});
-	if (muIt == lobbyData->loadedMatchupStats.end()) {
-		LobbyData::MatchupStatEntry entry{0, 0};
-
-		lobbyData->loadedMatchupStats[{mid, oid}] = entry;
-		muIt = lobbyData->loadedMatchupStats.find({mid, oid});
-	}
-
-	auto cardsIt = lobbyData->loadedCharacterCardUsage.find(mid);
-	if (cardsIt == lobbyData->loadedCharacterCardUsage.end()) {
-		lobbyData->loadedCharacterCardUsage[mid] = {0};
-		cardsIt = lobbyData->loadedCharacterCardUsage.find(mid);
-	}
-
-	// My stats
-	data->second.wins += chr.score >= 2;
-	data->second.losses += chr.score < 2;
-	// Random select
-	if (SokuLib::mainMode == SokuLib::BATTLE_MODE_VSSERVER ? selectedRandom.second : selectedRandom.first) {
-		auto rdata = lobbyData->loadedCharacterStats.find(SokuLib::CHARACTER_RANDOM);
-		if (rdata == lobbyData->loadedCharacterStats.end()) {
-			LobbyData::CharacterStatEntry entry{0, 0, 0, 0};
-
-			lobbyData->loadedCharacterStats[SokuLib::CHARACTER_RANDOM] = entry;
-			rdata = lobbyData->loadedCharacterStats.find(SokuLib::CHARACTER_RANDOM);
-		}
-		rdata->second.wins += chr.score >= 2;
-		rdata->second.losses += chr.score < 2;
-	}
-
-	// Against stats
-	dataAgainst->second.againstWins += chr.score >= 2;
-	dataAgainst->second.againstLosses += chr.score < 2;
-	// Random select
-	if (SokuLib::mainMode == SokuLib::BATTLE_MODE_VSSERVER ? selectedRandom.first : selectedRandom.second) {
-		auto rdataAgainst = lobbyData->loadedCharacterStats.find(SokuLib::CHARACTER_RANDOM);
-		if (rdataAgainst == lobbyData->loadedCharacterStats.end()) {
-			LobbyData::CharacterStatEntry entry{0, 0, 0, 0};
-
-			lobbyData->loadedCharacterStats[SokuLib::CHARACTER_RANDOM] = entry;
-			rdataAgainst = lobbyData->loadedCharacterStats.find(SokuLib::CHARACTER_RANDOM);
-		}
-		rdataAgainst->second.againstWins += chr.score >= 2;
-		rdataAgainst->second.againstLosses += chr.score < 2;
-	}
-
-	// Matchup stats
-	muIt->second.wins += chr.score >= 2;
-	muIt->second.losses += chr.score < 2;
-
-	// Cards stats
-	bool usedAll = true;
-
-	cardsIt->second.nbGames++;
-	for (auto card : cardsBurnt) {
-		auto cardIt = cardsIt->second.cards.find(card.second);
-
-		if (cardIt == cardsIt->second.cards.end()) {
-			cardsIt->second.cards[card.second] = {0, 0, 0};
-			cardIt = cardsIt->second.cards.find(card.second);
-		}
-		cardIt->second.burnt++;
-	}
-	for (auto card : cardsUsed) {
-		auto cardIt = cardsIt->second.cards.find(card.second);
-
-		if (cardIt == cardsIt->second.cards.end()) {
-			cardsIt->second.cards[card.second] = {0, 0, 0};
-			cardIt = cardsIt->second.cards.find(card.second);
-		}
-		cardIt->second.used++;
-	}
-	for (auto card : deck) {
-		auto cardIt = cardsIt->second.cards.find(card);
-
-		if (cardIt == cardsIt->second.cards.end()) {
-			cardsIt->second.cards[card] = {0, 0, 0};
-			cardIt = cardsIt->second.cards.find(card);
-		}
-		cardIt->second.inDeck++;
-	}
-	lobbyData->saveStats();
-
-
-	// Wins achievements
-	auto &wins = lobbyData->achievementByRequ["win"];
-	auto it = std::find_if(wins.begin(), wins.end(), [mid, &data](LobbyData::Achievement *achievement){
-		return !achievement->awarded && achievement->requirement["chr"] == mid && achievement->requirement["count"] <= data->second.wins;
-	});
-
-	if (it != wins.end()) {
-		(*it)->awarded = true;
-		lobbyData->achievementAwardQueue.push_back(*it);
-	}
-
-	// Losses achievements
-	auto &loss = lobbyData->achievementByRequ["lose"];
-	it = std::find_if(loss.begin(), loss.end(), [mid, &data](LobbyData::Achievement *achievement){
-		return !achievement->awarded && achievement->requirement["chr"] == mid && achievement->requirement["count"] <= data->second.losses;
-	});
-	if (it != loss.end()) {
-		(*it)->awarded = true;
-		lobbyData->achievementAwardQueue.push_back(*it);
-	}
-
-	// Play achievements
-	auto &play = lobbyData->achievementByRequ["play"];
-	it = std::find_if(play.begin(), play.end(), [mid, &data](LobbyData::Achievement *achievement){
-		return !achievement->awarded && achievement->requirement["chr"] == mid && achievement->requirement["count"] <= data->second.losses + data->second.wins;
-	});
-	if (it != play.end()) {
-		(*it)->awarded = true;
-		lobbyData->achievementAwardQueue.push_back(*it);
-	}
-
-	// Win move
-	if (chr.score >= 2) {
-		printf("Won! %i %i %i %i\n", chr.score, mid, chr.objectBase.action, chr.objectBase.actionBlockId);
-		auto &win_move = lobbyData->achievementByRequ["win_move"];
-		it = std::find_if(win_move.begin(), win_move.end(), [mid, &chr](LobbyData::Achievement *achievement){
-			if (achievement->awarded)
-				return false;
-			if (achievement->requirement.contains("stage") && SokuLib::stageId != achievement->requirement["stage"])
-				return false;
-			if (achievement->requirement.contains("chr") && achievement->requirement["chr"] != mid)
-				return false;
-			if (achievement->requirement["action"] != chr.objectBase.action)
-				return false;
-			if (achievement->requirement.contains("block_blacklist")) {
-				auto list = achievement->requirement["block_blacklist"].get<std::vector<int>>();
-
-				if (std::find(list.begin(), list.end(), chr.objectBase.actionBlockId) != list.end())
-					return false;
-			}
-			if (achievement->requirement.contains("block_whitelist")) {
-				auto list = achievement->requirement["block_whitelist"].get<std::vector<int>>();
-
-				if (std::find(list.begin(), list.end(), chr.objectBase.actionBlockId) == list.end())
-					return false;
-			}
-			return true;
-		});
-		if (it != win_move.end()) {
-			(*it)->awarded = true;
-			lobbyData->achievementAwardQueue.push_back(*it);
-		}
-	}
-
-	// All cards achievements
-	auto textures = lobbyData->cardsTextures.find(mid);
-	bool allCards = true;
-	for (const auto &elem : textures->second) {
-		auto cardIt = cardsIt->second.cards.find(elem.first);
-
-		if (cardIt == cardsIt->second.cards.end() || cardIt->second.used == 0) {
-			allCards = false;
-			break;
-		}
-	}
-	if (allCards) {
-		auto &cards = lobbyData->achievementByRequ["cards"];
-		auto itCardsAch = std::find_if(cards.begin(), cards.end(), [mid](LobbyData::Achievement *achievement){
-			return !achievement->awarded && achievement->requirement["chr"] == mid;
-		});
-
-		if (itCardsAch != cards.end()) {
-			(*itCardsAch)->awarded = true;
-			lobbyData->achievementAwardQueue.push_back(*itCardsAch);
-		}
-	}
-
-	bool defaultAllMax = true;
-	for (int i = 0; i < characters[mid].nbSkills / 3; i++)
-		if (chr.skillMap[i].notUsed || chr.skillMap[i].level < 4) {
-			defaultAllMax = false;
-			break;
-		}
-	if (defaultAllMax) {
-		auto &winMaxDefault = lobbyData->achievementByRequ["win_max_default"];
-		auto winMaxDAch = std::find_if(winMaxDefault.begin(), winMaxDefault.end(), [](LobbyData::Achievement *achievement){
-			return !achievement->awarded;
-		});
-
-		if (winMaxDAch != winMaxDefault.end()) {
-			(*winMaxDAch)->awarded = true;
-			lobbyData->achievementAwardQueue.push_back(*winMaxDAch);
-		}
-	}
-
-	std::map<unsigned, unsigned> cardsUsed;
-	auto &useCards = lobbyData->achievementByRequ["use_card"];
-	for (auto &data : lobbyData->loadedCharacterCardUsage) {
-		for (auto &card : data.second.cards) {
-			if (cardsUsed.find(card.first) == cardsUsed.end())
-				cardsUsed[card.first] = 0;
-			cardsUsed[card.first] += card.second.used;
-		}
-	}
-	for (auto &card : cardsIt->second.cards) {
-		auto useCardIt = std::find_if(useCards.begin(), useCards.end(), [mid, &card](LobbyData::Achievement *achievement){
-			return !achievement->awarded &&
-			       achievement->requirement.contains("chr") &&
-			       achievement->requirement["chr"] == mid &&
-			       card.second.used > achievement->requirement["count"] &&
-			       achievement->requirement["id"] == card.first;
-		});
-
-		if (useCardIt != useCards.end()) {
-			(*useCardIt)->awarded = true;
-			lobbyData->achievementAwardQueue.push_back(*useCardIt);
-		}
-	}
-	for (auto &card : cardsUsed) {
-		printf("Card %u was used %u times.\n", card.first, card.second);
-		auto useCardIt = std::find_if(useCards.begin(), useCards.end(), [mid, &card](LobbyData::Achievement *achievement){
-			return !achievement->awarded &&
-			       card.second > achievement->requirement["count"] &&
-			       achievement->requirement["id"] == card.first;
-		});
-
-		if (useCardIt != useCards.end()) {
-			(*useCardIt)->awarded = true;
-			lobbyData->achievementAwardQueue.push_back(*useCardIt);
-		}
-	}
-	lobbyData->saveAchievements();
+	if (!lobbyData) return;
+	try { lobbyData->recordCharacterGame(character, randomSelection); }
+	catch (const std::exception &e) { fprintf(stderr, "Cannot record character game: %s\n", e.what()); }
 }
 
 int __fastcall ConnectOnProcess(SokuLib::MenuConnect *This)
@@ -930,47 +611,28 @@ int __fastcall SelectOnProcess(SokuLib::Select *This)
 	return (This->*og_SelectOnProcess)();
 }
 
-void rollbackEvents()
-{
-	while (!cardsBurnt.empty() && cardsBurnt.back().first >= currentFrame) {
-		printf("Rolling back card %u burnt on frame %u\n", cardsBurnt.back().second, cardsBurnt.back().first);
-		cardsBurnt.pop_back();
-	}
-	while (!cardsUsed.empty() && cardsUsed.back().first >= currentFrame) {
-		printf("Rolling back card %u used on frame %u\n", cardsUsed.back().second, cardsUsed.back().first);
-		cardsUsed.pop_back();
-	}
-}
-
 int __fastcall CBattleManager_OnProcess(SokuLib::BattleManager *mgr)
 {
-	int result = (mgr->*og_BattleMgrOnProcess)();
-
-	if (!init) {
-		auto &chr = SokuLib::mainMode == SokuLib::BATTLE_MODE_VSSERVER ? mgr->rightCharacterManager : mgr->leftCharacterManager;
-
-		deck.clear();
-		cardsUsed.clear();
-		cardsBurnt.clear();
-		for (unsigned i = 0; i < chr.deckInfo.deck.size; i++)
-			deck.push_back(chr.deckInfo.deck[i]);
-		init = true;
-	}
-	if (mgr->matchState > 4 && !counted) {
+	// Snapshot before the original call: it may transition or tear down the battle.
+	const auto mode = SokuLib::mainMode;
+	const bool playing = mode == SokuLib::BATTLE_MODE_VSSERVER || mode == SokuLib::BATTLE_MODE_VSCLIENT;
+	const bool finished = playing && mgr->matchState > 4;
+	const auto character = mode == SokuLib::BATTLE_MODE_VSSERVER ? SokuLib::rightChar : SokuLib::leftChar;
+	const bool randomSelection = mode == SokuLib::BATTLE_MODE_VSSERVER ? selectedRandom.second : selectedRandom.first;
+	const auto result = (mgr->*og_BattleMgrOnProcess)();
+	if (finished && !counted) {
 		counted = true;
-		countGame();
+		countGame(static_cast<unsigned char>(character), randomSelection);
 	}
 	return result;
 }
 
 int __fastcall BattleOnProcess(SokuLib::Battle *This)
 {
-	auto &mgr = SokuLib::getBattleMgr();
 	auto ret = (This->*og_BattleOnProcess)();
 
 	if (ret != SokuLib::SCENE_BATTLE) {
 		counted = false;
-		init = false;
 	}
 	return ret;
 }
@@ -990,7 +652,6 @@ int __fastcall LoadingWatchOnProcess(SokuLib::LoadingWatch *This)
 }
 int __fastcall BattleClientOnProcess(SokuLib::BattleClient *This)
 {
-	auto &mgr = SokuLib::getBattleMgr();
 	if (activeMenu)
 		activeMenu->routePendingHotkeys();
 	auto ret = (This->*og_BattleClientOnProcess)();
@@ -998,7 +659,6 @@ int __fastcall BattleClientOnProcess(SokuLib::BattleClient *This)
 	processCommon(false);
 	if (ret != SokuLib::SCENE_BATTLECL) {
 		counted = false;
-		init = false;
 	}
 	return ret;
 }
@@ -1019,7 +679,6 @@ int __fastcall LoadingClientOnProcess(SokuLib::LoadingClient *This)
 }
 int __fastcall BattleServerOnProcess(SokuLib::BattleServer *This)
 {
-	auto &mgr = SokuLib::getBattleMgr();
 	if (activeMenu)
 		activeMenu->routePendingHotkeys();
 	auto ret = (This->*og_BattleServerOnProcess)();
@@ -1027,7 +686,6 @@ int __fastcall BattleServerOnProcess(SokuLib::BattleServer *This)
 	processCommon(false);
 	if (ret != SokuLib::SCENE_BATTLESV) {
 		counted = false;
-		init = false;
 	}
 	return ret;
 }
@@ -1196,6 +854,7 @@ void loadSoku2CSV(LPWSTR path)
 
 void onUpdate()
 {
+	Connection::pumpNetworkEvents();
 #ifdef _DEBUG
 	if (SokuLib::checkKeyOneshot(DIK_F4, false, false, false) && !activeMenu) {
 		try {
@@ -1368,18 +1027,6 @@ void getModVersionStr()
 	*strrchr(modVersion, '.') = 0;
 }
 
-void __declspec(naked) rollbackChecker()
-{
-	__asm {
-		pushad
-		pushfd
-		call rollbackEvents
-		popfd
-		popad
-		ret
-	}
-}
-
 extern "C" __declspec(dllexport) bool CheckVersion(const BYTE hash[16]) {
 	return memcmp(SokuLib::targetHash, hash, 16) == 0;
 }
@@ -1531,19 +1178,6 @@ extern "C" __declspec(dllexport) bool Initialize(HMODULE hMyModule, HMODULE hPar
 		og_onUpdate = nullptr;
 	} else
 		og_onUpdate = SokuLib::TamperNearJmpOpr(0x407E6B, onUpdate);
-	new SokuLib::Trampoline(0x469C77, (void (*)())onCardUsed, 7);
-	// Check for GR hook, and if so, hook on top to check for rollbacks
-	if (*(unsigned char *)0x482701 == 0xE9) {
-		// First, we force the hook into a call, instead of a JMP
-		*(char *)0x482701 = 0xE8;
-		// GR doesn't clean that byte so we nop it
-		*(char *)0x482706 = 0x90;
-		// We grab the start of the hook in memory
-		int hookAddr = *(int *)0x482702 + 0x482706;
-		// And we replace the footer so that it calls our function instead of jumping back
-		SokuLib::TamperNearJmp(hookAddr + 0x1A, rollbackChecker);
-	}
-	og_call48AD33 = SokuLib::TamperNearJmpOpr(0x48AD33, coinUsed);
 	VirtualProtect((PVOID)TEXT_SECTION_OFFSET, TEXT_SECTION_SIZE, old, &old);
 
 	FlushInstructionCache(GetCurrentProcess(), nullptr, 0);

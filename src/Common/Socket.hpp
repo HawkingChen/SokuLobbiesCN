@@ -15,6 +15,8 @@ typedef int SOCKET;
 #endif
 #include <map>
 #include <string>
+#include <atomic>
+#include <chrono>
 
 #ifdef _WIN32
 std::string getLastSocketError(int err = WSAGetLastError());
@@ -65,6 +67,8 @@ public:
 	//! @param host The host to connect to.
 	//! @param portno The port number used to connect to the host.
 	virtual void connect(const std::string &host, unsigned short portno);
+	// Client transport: cancellable TCP establishment, leaves the socket nonblocking.
+	void connectWithTimeout(const std::string &host, unsigned short portno, std::chrono::milliseconds timeout, const std::atomic_bool &running);
 
 	//! @brief Connect the Socket to an ip.
 	//! @param ip The ip to connect to.
@@ -148,9 +152,9 @@ public:
 
 protected:
 	mutable bool _noDestroy = false;
-	SOCKET _sockfd = INVALID_SOCKET; //!< The socket
-	mutable bool _opened = false; //!< The status of the socket.
-	struct sockaddr_in _remote;
+	std::atomic<SOCKET> _sockfd{INVALID_SOCKET}; //!< The socket
+	mutable std::atomic_bool _opened{false}; //!< The status of the socket.
+	struct sockaddr_in _remote{};
 };
 
 #endif // DISC_ORD_SOCKET_HPP

@@ -1,4 +1,5 @@
 #include "RelativeRatings.hpp"
+#include "RatingsNetworkDiagnostics.hpp"
 
 #include <Windows.h>
 #include <curl/curl.h>
@@ -414,15 +415,57 @@ void RelativeRatings::_downloadProfiles(const std::vector<std::string> &profiles
 			curl_easy_setopt(curl, CURLOPT_POSTFIELDS, postBody->c_str());
 			curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, static_cast<long>(postBody->size()));
 		}
+		_debugLog("request start: " + label + " backend=mbedTLS route=default verify_peer=true verify_host=true connect_timeout=6s timeout=15s");
 		const auto result = curl_easy_perform(curl);
 		long code = 0;
 		curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &code);
 		lastFetchInfo = label + " result=" + curl_easy_strerror(result) + " http=" + std::to_string(code) +
 			" bytes=" + std::to_string(response.body.size());
+#ifdef SOKU_RATINGS_DIAGNOSTICS
+		char *remote = nullptr;
+		char *local = nullptr;
+		long port = 0, osError = 0, verify = 0, tunnelStatus = 0;
+		double dns = 0, tcp = 0, tls = 0, firstByte = 0, total = 0;
+		curl_easy_getinfo(curl, CURLINFO_PRIMARY_IP, &remote);
+		curl_easy_getinfo(curl, CURLINFO_LOCAL_IP, &local);
+		curl_easy_getinfo(curl, CURLINFO_PRIMARY_PORT, &port);
+		curl_easy_getinfo(curl, CURLINFO_OS_ERRNO, &osError);
+		curl_easy_getinfo(curl, CURLINFO_SSL_VERIFYRESULT, &verify);
+		curl_easy_getinfo(curl, CURLINFO_HTTP_CONNECTCODE, &tunnelStatus);
+		curl_easy_getinfo(curl, CURLINFO_NAMELOOKUP_TIME, &dns);
+		curl_easy_getinfo(curl, CURLINFO_CONNECT_TIME, &tcp);
+		curl_easy_getinfo(curl, CURLINFO_APPCONNECT_TIME, &tls);
+		curl_easy_getinfo(curl, CURLINFO_STARTTRANSFER_TIME, &firstByte);
+		curl_easy_getinfo(curl, CURLINFO_TOTAL_TIME, &total);
+		lastFetchInfo += " curl_code=" + std::to_string(result) + " remote=[" + (remote ? remote : "unknown") + "]:" +
+			std::to_string(port) + " local=[" + (local ? local : "unknown") + "] os_error=" + std::to_string(osError) +
+			" verify_result=" + std::to_string(verify) + " proxy_connect_http=" + std::to_string(tunnelStatus) +
+			" cumulative_ms[dns,tcp,tls,first_byte,total]=" + std::to_string(dns * 1000) + "," +
+			std::to_string(tcp * 1000) + "," + std::to_string(tls * 1000) + "," +
+			std::to_string(firstByte * 1000) + "," + std::to_string(total * 1000);
+		if (result == CURLE_SSL_CONNECT_ERROR) lastFetchInfo += " category=TLS_handshake_failed_or_reset";
+		else if (result == CURLE_PEER_FAILED_VERIFICATION || result == CURLE_SSL_CACERT_BADFILE)
+			lastFetchInfo += " category=certificate_or_CA_file";
+#endif
 		if (result != CURLE_OK && errorBuffer[0])
 			lastFetchInfo += " detail=" + std::string(errorBuffer);
 		curl_easy_cleanup(curl);
 		curl_slist_free_all(headers);
+		_debugLog("request end: " + lastFetchInfo);
+#ifdef SOKU_RATINGS_NETWORK_PROBE
+		const bool transportFailure = result == CURLE_SSL_CONNECT_ERROR || result == CURLE_COULDNT_CONNECT ||
+			result == CURLE_COULDNT_RESOLVE_HOST || result == CURLE_OPERATION_TIMEDOUT ||
+			result == CURLE_RECV_ERROR || result == CURLE_SEND_ERROR || result == CURLE_GOT_NOTHING;
+		if (transportFailure && !_networkProbeDone && _enabled.load() && !_stopping.load()) {
+			_networkProbeDone = true;
+			try {
+				probeRatingsNetwork(url, postBody, caPath, _enabled, _stopping,
+					[this](const std::string &entry) { _debugLog(entry); });
+			} catch (const std::exception &error) {
+				_debugLog(std::string("network comparison stopped: ") + error.what());
+			}
+		}
+#endif
 		if (result != CURLE_OK || code != 200) return false;
 		body = std::move(response.body);
 		return !body.empty();
@@ -541,6 +584,9 @@ void RelativeRatings::_downloadProfiles(const std::vector<std::string> &profiles
 void RelativeRatings::_run()
 {
 	_loadMappings();
+#ifdef SOKU_RATINGS_NETWORK_PROBE
+	logRatingsNetworkEnvironment([this](const std::string &entry) { _debugLog(entry); });
+#endif
 	_debugLog(std::string("worker started ca_bundle_exists=") + (std::filesystem::exists(_caPath) ? "true" : "false"));
 	while (!_stopping.load(std::memory_order_relaxed)) {
 		if (!_enabled.load(std::memory_order_relaxed)) {

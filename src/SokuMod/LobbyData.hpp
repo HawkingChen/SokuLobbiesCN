@@ -17,9 +17,9 @@
 #include <curl/curl.h>
 #include "nlohmann/json.hpp"
 #include "RelativeRatings.hpp"
+#include "CharacterGameStats.hpp"
 
 #define EMOTE_SIZE 32
-#define CHR_STATS_MAGIC 0xF2A6E790
 
 class LobbyData {
 private:
@@ -38,15 +38,6 @@ private:
 	void _loadElevators();
 	void _loadAchievements();
 	void _loadFlags();
-	void _loadGameCards();
-
-	unsigned _getExpectedMagic();
-	void _loadCharacterStats(std::istream &stream);
-	void _loadCharacterCardUsage(std::istream &stream);
-	void _loadMatchupStats(std::istream &stream);
-	void _saveCharacterStats(std::ostream &stream);
-	void _saveCharacterCardUsage(std::ostream &stream);
-	void _saveMatchupStats(std::ostream &stream);
 
 	void _loadFont(SokuLib::SWRFont &font, unsigned size);
 
@@ -64,27 +55,8 @@ private:
 	unsigned _reward = 0;
 
 public:
-	//Stats
-	struct CharacterStatEntry {
-		unsigned wins;
-		unsigned losses;
-		unsigned againstWins;
-		unsigned againstLosses;
-	};
-	struct MatchupStatEntry {
-		unsigned wins;
-		unsigned losses;
-	};
-	struct CardStatEntry {
-		unsigned inDeck;
-		unsigned used;
-		unsigned burnt;
-	};
-	struct CardChrStatEntry {
-		unsigned nbGames;
-		std::map<unsigned, CardStatEntry> cards;
-	};
-
+	// Exclusively checked out by InLobbyMenu, returned on exit. Never alias handles.
+	SokuLib::DrawUtils::Texture lobbyMenuTextureCache[6];
 	struct Achievement {
 		std::string code;
 		std::string description;
@@ -237,10 +209,6 @@ public:
 		SokuLib::DrawUtils::Sprite holder;
 		SokuLib::DrawUtils::Sprite behindGear;
 	};
-	struct CardInfos : public SokuLib::DrawUtils::Sprite {
-		std::string cardName;
-	};
-
 	bool achievementsLocked = false;
 	ArcadeData arcades;
 	AchievementHolder achHolder;
@@ -252,11 +220,8 @@ public:
 	std::map<std::string, Emote *> emotesByName;
 	std::map<std::string, Avatar *> avatarsByCode;
 	std::map<std::string, std::unique_ptr<SokuLib::DrawUtils::Sprite>> flags;
-	std::map<unsigned char, CharacterStatEntry> loadedCharacterStats;
-	std::map<unsigned char, CardChrStatEntry> loadedCharacterCardUsage;
+	CharacterGameStats::Counts characterGames;
 	std::map<std::string, std::vector<Achievement *>> achievementByRequ;
-	std::map<std::pair<unsigned char, unsigned char>, MatchupStatEntry> loadedMatchupStats;
-	std::map<unsigned char, std::map<unsigned short, CardInfos>> cardsTextures;
 	std::list<Achievement *> achievementAwardQueue;
 
 	LobbyData();
@@ -268,6 +233,7 @@ public:
 	SokuLib::SWRFont &getFont(unsigned size);
 	void saveAchievements();
 	void saveStats();
+	void recordCharacterGame(unsigned char character, bool randomSelection);
 	void update();
 	void render();
 	RelativeRatings &relativeRatings() { return *_relativeRatings; }

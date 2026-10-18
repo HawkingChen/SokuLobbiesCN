@@ -24,11 +24,7 @@
 #include "getPublicIp.hpp"
 
 #define CRenderer_Unknown1 ((void (__thiscall *)(int, int))0x404AF0)
-#define runOnUI(fct) do {                     \
-        this->_queueMutex.lock();             \
-        this->_workerQueue.emplace_back(fct); \
-        this->_queueMutex.unlock();           \
-} while (false)
+#define runOnUI(fct) this->_queueUi(fct)
 
 
 extern bool activated;
@@ -202,6 +198,7 @@ LobbyMenu::LobbyMenu(SokuLib::MenuConnect *parent) :
 	this->_unlock.rect.width = this->_unlock.texture.getSize().x;
 	this->_unlock.rect.height = this->_unlock.texture.getSize().y;
 
+	_connectionSettings = _loadedSettings;
 	this->_netThread = std::thread(&LobbyMenu::_netLoop, this);
 	this->_connectThread = std::thread(&LobbyMenu::_connectLoop, this);
 	this->_masterThread = std::thread(&LobbyMenu::_masterServerLoop, this);
@@ -275,33 +272,39 @@ void (LobbyMenu::* const LobbyMenu::_renderCallbacks[])() = {
 
 void LobbyMenu::execUiCallbacks()
 {
-	int i = 0;
-
-	this->_queueMutex.lock();
-	for (auto &fct : this->_workerQueue) {
-		fct();
-		if (i >= 10)
-			break;
-		i++;
+	// Background snapshots may still own a removed entry. Keep its final owner on
+	// the game thread so sprite destruction cannot run on a network worker.
+	_retiredEntries.erase(std::remove_if(_retiredEntries.begin(), _retiredEntries.end(),
+		[](const std::shared_ptr<Entry> &entry) { return entry.use_count() == 1; }), _retiredEntries.end());
+	const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(2);
+	for (unsigned i = 0; i < 8 && std::chrono::steady_clock::now() < deadline; ++i) {
+		std::function<void()> work;
+		{
+			std::lock_guard<std::mutex> lock(_queueMutex);
+			if (!_workerQueue.empty()) { work = std::move(_workerQueue.front()); _workerQueue.pop_front(); }
+			else if (!_refreshQueue.empty()) {
+				auto first = _refreshQueue.find(_refreshOrder.front()); _refreshOrder.pop_front();
+				work = std::move(first->second); _refreshQueue.erase(first);
+			} else break;
+		}
+		work();
 	}
-	this->_workerQueue.clear();
-	this->_queueMutex.unlock();
+}
+
+void LobbyMenu::_queueUi(std::function<void()> work, const void *refreshKey)
+{
+	std::lock_guard<std::mutex> lock(_queueMutex);
+	if (refreshKey) {
+		if (_refreshQueue.count(refreshKey)) _refreshQueue[refreshKey] = std::move(work);
+		else if (_refreshQueue.size() < 1024) { _refreshOrder.push_back(refreshKey); _refreshQueue.emplace(refreshKey, std::move(work)); }
+	} else if (_workerQueue.size() < 1024) _workerQueue.emplace_back(std::move(work));
 }
 
 int LobbyMenu::onProcess()
 {
 	try {
-		int i = 0;
-
-		this->_queueMutex.lock();
-		for (auto &fct : this->_workerQueue) {
-			fct();
-			if (i >= 10)
-				break;
-			i++;
-		}
-		this->_workerQueue.clear();
-		this->_queueMutex.unlock();
+		{ std::lock_guard<std::mutex> lock(_settingsMutex); _connectionSettings = _loadedSettings; }
+		execUiCallbacks();
 		inputBoxUpdate();
 		if (inputBoxShown)
 			return true;
@@ -432,12 +435,14 @@ bool LobbyMenu::_joinLobbyUpdate()
 	if (SokuLib::inputMgrs.input.a == 1) {
 		if (this->_lobbyCtr < this->_connections.size() && this->_connections[this->_lobbyCtr]->c && this->_connections[this->_lobbyCtr]->c->isConnected()) {
 			auto c = this->_connections[this->_lobbyCtr];
+			auto selected = c->c;
 
 			if (c->passwd) {
-				setWideInputBoxCallbacks([this, c](const std::wstring &value){
-					if (c->c && c->c->isConnected()) {
-						c->c->setPassword(convertEncoding<wchar_t, char, UTF16Decode, UTF8Encode>(value));
-						SokuLib::activateMenu(new InLobbyMenu(this, this->_parent, c->c));
+				setWideInputBoxCallbacks([this, selected](const std::wstring &value){
+					if (selected && selected->isConnected()) {
+						selected->setPassword(convertEncoding<wchar_t, char, UTF16Decode, UTF8Encode>(value));
+						selected->setInitialPlayer(_loadedSettings);
+						SokuLib::activateMenu(new InLobbyMenu(this, this->_parent, selected));
 						this->_active = false;
 						playSound(0x28);
 					} else
@@ -445,6 +450,7 @@ bool LobbyMenu::_joinLobbyUpdate()
 				});
 				openWideInputDialog(chineseLanguage ? L"\u8F93\u5165\u5927\u5385\u5BC6\u7801" : L"Enter password", L"", 255, L'*');
 			} else {
+				this->_connections[this->_lobbyCtr]->c->setInitialPlayer(_loadedSettings);
 				SokuLib::activateMenu(new InLobbyMenu(this, this->_parent, this->_connections[this->_lobbyCtr]->c));
 				this->_active = false;
 				playSound(0x28);
@@ -798,7 +804,6 @@ void LobbyMenu::onLanguageChanged()
 void LobbyMenu::_masterServerLoop()
 {
 	while (this->_open) {
-		bool _locked = false;
 
 		if (this->_mainServer.isDisconnected())
 			try {
@@ -840,10 +845,17 @@ void LobbyMenu::_masterServerLoop()
 		try {
 			char packet[6] = {0};
 			std::vector<std::pair<unsigned short, std::string>> elems;
+			auto readEntry = [&] {
+				for (size_t received = 0; received < sizeof(packet);) {
+					const auto bytes = _mainServer.read(packet + received, static_cast<int>(sizeof(packet) - received));
+					if (!bytes) throw EOFException("Connection closed");
+					received += bytes;
+				}
+			};
 
 			packet[0] = 1;
-			this->_mainServer.send(packet, 3);
-			this->_mainServer.read(packet, 6);
+			this->_mainServer.send(std::string(packet, 3));
+			readEntry();
 			while (packet[0] || packet[1]) {
 				struct in_addr addr;
 
@@ -851,19 +863,19 @@ void LobbyMenu::_masterServerLoop()
 				addr.S_un.S_un_b.s_b2 = packet[3];
 				addr.S_un.S_un_b.s_b3 = packet[4];
 				addr.S_un.S_un_b.s_b4 = packet[5];
-				elems.emplace_back((unsigned short) packet[0] | ((unsigned short) packet[1]) << 8, inet_ntoa(addr));
-				this->_mainServer.read(packet, 6);
+				elems.emplace_back(static_cast<unsigned char>(packet[0]) | (static_cast<unsigned short>(static_cast<unsigned char>(packet[1])) << 8), inet_ntoa(addr));
+				readEntry();
 			}
-			_locked = true;
-			this->_connectionsMutex.lock();
-			this->_connections.erase(std::remove_if(this->_connections.begin(), this->_connections.end(), [&elems](const std::shared_ptr<Entry> &e){
-				return (!e->c || !e->c->isConnected()) && std::find_if(elems.begin(), elems.end(), [&e](const std::pair<unsigned short, std::string> &e1){
+			auto applyList = [this, elems = std::move(elems)] {
+				std::lock_guard<std::mutex> lock(_connectionsMutex);
+				this->_connections.erase(std::remove_if(this->_connections.begin(), this->_connections.end(), [&elems, this](const std::shared_ptr<Entry> &e){
+				const bool remove = (!e->c || !e->c->isConnected()) && std::find_if(elems.begin(), elems.end(), [&e](const std::pair<unsigned short, std::string> &e1){
 					return e->port == e1.first && e->ip == e1.second;
 				}) == elems.end();
-			}), this->_connections.end());
-			this->_connectionsMutex.unlock();
-			for (auto &elem : elems) {
-				this->_connectionsMutex.lock();
+				if (remove) _retiredEntries.push_back(e);
+				return remove;
+				}), this->_connections.end());
+				for (const auto &elem : elems) {
 				if (std::find_if(this->_connections.begin(), this->_connections.end(), [&elem](const std::shared_ptr<Entry> &e){
 					return e->ip == elem.second && e->port == elem.first;
 				}) == this->_connections.end()) {
@@ -871,15 +883,15 @@ void LobbyMenu::_masterServerLoop()
 
 					auto c = this->_connections.back();
 
-					this->_connectionsMutex.unlock();
 					auto fct = [c]{
 						setLobbyText(c->name, chineseLanguage ? L"\u5927\u5385\u8FDE\u63A5\u6B63\u5728\u6392\u961F..." : L"Connection to the lobby in queue...", 16, {300, 74});
 						c->name.tint = SokuLib::Color{0xA0, 0xA0, 0xA0, 0xFF};
 					};
 					runOnUI(fct);
-				} else
-					this->_connectionsMutex.unlock();
-			}
+				}
+				}
+			};
+			_queueUi(std::move(applyList), this);
 		} catch (std::exception &e) {
 			if (dynamic_cast<EOFException *>(&e))
 				this->_mainServer.disconnect();
@@ -896,8 +908,6 @@ void LobbyMenu::_masterServerLoop()
 			};
 			runOnUI(fct);
 			this->_lastError = e.what();
-			if (_locked)
-				this->_connectionsMutex.unlock();
 		}
 	fail:
 		for (int i = 0; i < 100 && this->_open; i++)
@@ -918,13 +928,14 @@ void LobbyMenu::_connectLoop()
 			}
 
 			auto connection = this->_connections[j];
+			auto transport = connection->c;
 
 			this->_connectionsMutex.unlock();
 
 			auto weak = std::weak_ptr(connection);
 
 			try {
-				if (!connection->c || !connection->c->isConnected()) {
+				if (!transport || !transport->isConnected()) {
 					if (i != 0 && !connection->first)
 						continue;
 					connection->first = false;
@@ -945,10 +956,14 @@ void LobbyMenu::_connectLoop()
 					}
 					if (!this->_open)
 						break;
-					connection->c = std::make_shared<Connection>(ip, connection->port, this->_loadedSettings);
+					Player settings;
+					{ std::lock_guard<std::mutex> lock(_settingsMutex); settings = _connectionSettings; }
+					transport = std::make_shared<Connection>(ip, connection->port, settings);
+					std::shared_ptr<Connection> retired;
+					{ std::lock_guard<std::mutex> lock(_connectionsMutex); retired.swap(connection->c); connection->c = transport; }
 
-					std::lock_guard<std::mutex> functionMutexGuard(connection->c->functionMutex);
-					connection->c->onError = [weak, this](const std::string &msg) {
+					std::lock_guard<std::mutex> functionMutexGuard(transport->functionMutex);
+					transport->onError = [weak, this](const std::string &msg) {
 						auto fct = [weak, msg, this]{
 							auto c = weak.lock();
 
@@ -968,7 +983,7 @@ void LobbyMenu::_connectLoop()
 						};
 						runOnUI(fct);
 					};
-					connection->c->onImpMsg = [weak, this](const std::string &msg) {
+					transport->onImpMsg = [weak, this](const std::string &msg) {
 						auto fct = [weak, msg, this]{
 							auto c = weak.lock();
 
@@ -989,14 +1004,15 @@ void LobbyMenu::_connectLoop()
 						};
 						runOnUI(fct);
 					};
-					connection->c->startThread();
+					transport->startThread();
 				}
 
-				auto info = connection->c->getLobbyInfo();
-
-				connection->passwd = info.hasPwd;
-				if (connection->lastName != info.name) {
-					auto fct = [info, connection]{
+				auto info = transport->getLobbyInfo();
+				auto fct = [info, connection, transport, this]{
+					{ std::lock_guard<std::mutex> lock(_connectionsMutex); if (connection->c != transport) return; }
+					if (!transport->isConnected()) return;
+					connection->passwd = info.hasPwd;
+					if (connection->lastName != info.name) {
 						SokuLib::Vector2i size;
 						int texId = 0;
 
@@ -1011,14 +1027,11 @@ void LobbyMenu::_connectLoop()
 						connection->name.rect.width = connection->name.texture.getSize().x;
 						connection->name.rect.height = connection->name.texture.getSize().y;
 						connection->name.tint = SokuLib::Color::White;
-					};
-					runOnUI(fct);
-				}
-				if (
-					connection->lastPlayerCount.first != info.currentPlayers ||
-					connection->lastPlayerCount.second != info.maxPlayers
-				) {
-					auto fct = [info, connection]{
+					}
+					if (
+						connection->lastPlayerCount.first != info.currentPlayers ||
+						connection->lastPlayerCount.second != info.maxPlayers
+					) {
 						SokuLib::Vector2i size;
 
 						connection->lastPlayerCount = {info.currentPlayers, info.maxPlayers};
@@ -1027,17 +1040,17 @@ void LobbyMenu::_connectLoop()
 						connection->playerCount.rect.width = connection->playerCount.getSize().x;
 						connection->playerCount.rect.height = connection->playerCount.getSize().y;
 						connection->playerCount.tint = SokuLib::Color::White;
-					};
-					runOnUI(fct);
-				}
+					}
+				};
+				_queueUi(std::move(fct), connection.get());
 			} catch (std::exception &e) {
 				if (!this->_open)
 					break;
-				auto ptr = strdup(e.what());
+				auto ptr = std::string(e.what());
 				auto fct = [ptr, connection]{
 					connection->lastName.clear();
 					connection->lastPlayerCount = {0, 0};
-					connection->name.texture.createFromText(ptr, lobbyData->getFont(16), {300, 74});
+					connection->name.texture.createFromText(ptr.c_str(), lobbyData->getFont(16), {300, 74});
 					connection->name.setSize({
 						connection->name.texture.getSize().x,
 						connection->name.texture.getSize().y
@@ -1047,7 +1060,6 @@ void LobbyMenu::_connectLoop()
 					connection->name.tint = SokuLib::Color::Red;
 					connection->playerCount.texture.destroy();
 					connection->playerCount.setSize({0, 0});
-					free(ptr);
 				};
 
 				runOnUI(fct);

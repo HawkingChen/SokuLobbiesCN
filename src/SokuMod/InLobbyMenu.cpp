@@ -19,6 +19,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include "InLobbyMenu.hpp"
+#include "ClientChatLog.hpp"
 #include "LobbyData.hpp"
 #include "data.hpp"
 #include "SmallHostlist.hpp"
@@ -64,6 +65,37 @@ InLobbyMenu *activeMenu = nullptr;
 static WNDPROC Original_WndProc = nullptr;
 static std::mutex ptrMutex;
 static std::mt19937 random;
+
+namespace {
+	void transferLobbyTexture(SokuLib::DrawUtils::Texture &from, SokuLib::DrawUtils::Texture &to) {
+		if (!from.hasTexture()) return;
+		const auto size = from.getSize();
+		to.setHandle(from.releaseHandle(), size);
+	}
+	// Log slow preparation only; never include player names or chat contents.
+	struct LobbyPreparationTimer {
+		const char *label;
+		std::chrono::steady_clock::time_point started = std::chrono::steady_clock::now();
+		~LobbyPreparationTimer() noexcept {
+			try {
+				const auto elapsed = std::chrono::steady_clock::now() - started;
+				if (elapsed < std::chrono::milliseconds(4)) return;
+				static auto lastLog = std::chrono::steady_clock::time_point{};
+				const auto now = std::chrono::steady_clock::now();
+				if (now - lastLog < std::chrono::seconds(1)) return;
+				lastLog = now;
+				const auto path = std::filesystem::path(profileFolderPath) / "lobby-performance.log";
+				std::error_code ec;
+				const auto bytes = std::filesystem::file_size(path, ec);
+				if (FILE *file = _wfopen(path.c_str(), !ec && bytes > 1024 * 1024 ? L"w" : L"a")) {
+					fprintf(file, "tick=%llu %s elapsed_us=%lld\n", GetTickCount64(), label,
+						static_cast<long long>(std::chrono::duration_cast<std::chrono::microseconds>(elapsed).count()));
+					fclose(file);
+				}
+			} catch (...) {}
+		}
+	};
+}
 
 struct RecentOpponentSession {
 	uint32_t playerId;
@@ -151,6 +183,8 @@ static std::string localizeLobbyMessage(const std::string &message)
 		return "无法获取IP地址，请使用swarm的IP用于大厅";
 	if (message == "Connection closed")
 		return "与服务器的连接已关闭。";
+	if (message == "Failed to join lobby: Connection timed out.")
+		return "进入大厅失败：连接超时。";
 	if (message == "You have been blacklisted by this player.")
 		return "你已被该玩家拉黑。";
 	if (message == "This player is in your blacklist.")
@@ -489,11 +523,12 @@ void InLobbyMenu::_openMessageBox(int sound, const std::string &text, const std:
 	}
 }
 
-InLobbyMenu::InLobbyMenu(LobbyMenu *menu, SokuLib::MenuConnect *parent, std::shared_ptr<Connection> &connection) :
+InLobbyMenu::InLobbyMenu(LobbyMenu *menu, SokuLib::MenuConnect *parent, const std::shared_ptr<Connection> &connection) :
 	_connection(connection),
 	_parent(parent),
 	_menu(menu)
 {
+	LobbyPreparationTimer preparationTimer{"lobby-constructor"};
 	SokuLib::FontDescription desc;
 	bool hasEnglishPatch = (*(int *)0x411c64 == 1);
 
@@ -525,8 +560,11 @@ InLobbyMenu::InLobbyMenu(LobbyMenu *menu, SokuLib::MenuConnect *parent, std::sha
 	this->_textBubbleFont.create();
 	this->_textBubbleFont.setIndirect(desc);
 	this->_initEmotePickerOrder();
-	this->_initQuickMessageSprites();
-	this->_initChatPopupModeSprites();
+	for (unsigned i = 0; i < 3; ++i)
+		transferLobbyTexture(lobbyData->lobbyMenuTextureCache[i], this->_battleStatus[i].texture);
+	transferLobbyTexture(lobbyData->lobbyMenuTextureCache[3], this->_chatSeat.texture);
+	transferLobbyTexture(lobbyData->lobbyMenuTextureCache[4], this->_messageBox.texture);
+	transferLobbyTexture(lobbyData->lobbyMenuTextureCache[5], this->_loadingGear.texture);
 
 	for (int i = 0; i < 3; i++) {
 		const char *paths[3] = {
@@ -535,7 +573,8 @@ InLobbyMenu::InLobbyMenu(LobbyMenu *menu, SokuLib::MenuConnect *parent, std::sha
 			"assets/lobby/watching.png",
 		};
 
-		this->_battleStatus[i].texture.loadFromFile((std::filesystem::path(profileFolderPath) / paths[i]).string().c_str());
+		if (!this->_battleStatus[i].texture.hasTexture())
+			this->_battleStatus[i].texture.loadFromFile((std::filesystem::path(profileFolderPath) / paths[i]).string().c_str());
 		this->_battleStatus[i].setSize({
 			this->_battleStatus[i].texture.getSize().x,
 			this->_battleStatus[i].texture.getSize().y
@@ -545,7 +584,8 @@ InLobbyMenu::InLobbyMenu(LobbyMenu *menu, SokuLib::MenuConnect *parent, std::sha
 		this->_battleStatus[i].setPosition({174, 218});
 	}
 
-	this->_chatSeat.texture.loadFromFile((std::filesystem::path(profileFolderPath) / "assets/lobby/chat_seat.png").string().c_str());
+	if (!this->_chatSeat.texture.hasTexture())
+		this->_chatSeat.texture.loadFromFile((std::filesystem::path(profileFolderPath) / "assets/lobby/chat_seat.png").string().c_str());
 	this->_chatSeat.setSize({
 		this->_chatSeat.texture.getSize().x,
 		this->_chatSeat.texture.getSize().y
@@ -564,7 +604,8 @@ InLobbyMenu::InLobbyMenu(LobbyMenu *menu, SokuLib::MenuConnect *parent, std::sha
 	this->_loadingText.rect.height = this->_loadingText.texture.getSize().y;
 	this->_loadingText.setPosition({174, 218});
 
-	this->_messageBox.texture.loadFromGame("data/menu/21_Base.cv2");
+	if (!this->_messageBox.texture.hasTexture())
+		this->_messageBox.texture.loadFromGame("data/menu/21_Base.cv2");
 	this->_messageBox.setSize({
 		this->_messageBox.texture.getSize().x,
 		this->_messageBox.texture.getSize().y
@@ -573,7 +614,8 @@ InLobbyMenu::InLobbyMenu(LobbyMenu *menu, SokuLib::MenuConnect *parent, std::sha
 	this->_messageBox.rect.height = this->_messageBox.texture.getSize().y;
 	this->_messageBox.setPosition({155, 203});
 
-	this->_loadingGear.texture.loadFromGame("data/scene/logo/gear.bmp");
+	if (!this->_loadingGear.texture.hasTexture())
+		this->_loadingGear.texture.loadFromGame("data/scene/logo/gear.bmp");
 	this->_loadingGear.setSize({
 		this->_loadingGear.texture.getSize().x,
 		this->_loadingGear.texture.getSize().y
@@ -593,8 +635,6 @@ InLobbyMenu::InLobbyMenu(LobbyMenu *menu, SokuLib::MenuConnect *parent, std::sha
 		this->_textSprite[0].rect.height
 	}.to<unsigned>());
 	this->_textSprite[0].setPosition({CURSOR_STARTX - (*(int *)0x411c64 == 1) * 2, CURSOR_STARTY});
-	for (int i = ' '; i < 0x100; i++)
-		this->_getTextSize(i);
 	std::lock_guard<std::mutex> functionMutexGuard(this->_connection->functionMutex);
 	this->onConnectRequest = this->_connection->onConnectRequest;
 	this->onError = this->_connection->onError;
@@ -604,6 +644,7 @@ InLobbyMenu::InLobbyMenu(LobbyMenu *menu, SokuLib::MenuConnect *parent, std::sha
 	this->onConnect = this->_connection->onConnect;
 	this->onPlayerJoin = this->_connection->onPlayerJoin;
 	this->onPlayerLeave = this->_connection->onPlayerLeave;
+	this->onDisconnect = this->_connection->onDisconnect;
 	this->_connection->onDisconnect = [this]{
 		this->_disconnected = true;
 	};
@@ -910,11 +951,12 @@ InLobbyMenu::InLobbyMenu(LobbyMenu *menu, SokuLib::MenuConnect *parent, std::sha
 			if (this->_connection->isInit())
 				return;
 			this->_connection->connect();
-			std::this_thread::sleep_for(std::chrono::seconds(lobbyJoinInterval));
+			const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(lobbyJoinInterval);
+			while (!_disconnected && std::chrono::steady_clock::now() < deadline)
+				std::this_thread::sleep_for(std::chrono::milliseconds(50));
 		}
-		playSound(38);
-		this->_wasConnected = true;
-		MessageBoxW(SokuLib::window, L"Failed to join lobby: Connection timed out.", L"Timed out", MB_ICONERROR);
+		if (!_disconnected && !_connection->isInit() && _connection->isConnected())
+			_connection->error("Failed to join lobby: Connection timed out.");
 	}};
 	ptrMutex.lock();
 	activeMenu = this;
@@ -924,15 +966,6 @@ InLobbyMenu::InLobbyMenu(LobbyMenu *menu, SokuLib::MenuConnect *parent, std::sha
 			// * (char *)0x0089FFDC: is Soku still running
 			if (!*(char *)0x0089FFDC)
 				return;
-			this->_connection->meMutex.lock();
-			if (SokuLib::sceneId != SokuLib::SCENE_TITLE && this->_connection->getMe()->battleStatus == Lobbies::BATTLE_STATUS_WAITING) {
-				Lobbies::PacketBattleStatusUpdate packet{0, Lobbies::BATTLE_STATUS_PLAYING};
-
-				this->_connection->send(&packet, sizeof(packet));
-				this->_connection->getMe()->battleStatus = Lobbies::BATTLE_STATUS_PLAYING;
-				this->_connection->sendGameInfo();
-			}
-			this->_connection->meMutex.unlock();
 			if (SokuLib::sceneId == SokuLib::SCENE_BATTLECL || SokuLib::sceneId == SokuLib::SCENE_BATTLESV)
 				continue;
 
@@ -956,6 +989,7 @@ InLobbyMenu::InLobbyMenu(LobbyMenu *menu, SokuLib::MenuConnect *parent, std::sha
 
 InLobbyMenu::~InLobbyMenu()
 {
+	const bool wasDisconnected = _disconnected.exchange(true);
 	if (this->_hostlist)
 		this->_hostlist->requestStop();
 	for (auto &hostlist : this->_retiredHostlists)
@@ -968,8 +1002,7 @@ InLobbyMenu::~InLobbyMenu()
 	if (this->immCtx)
 		ImmReleaseContext(SokuLib::window, this->immCtx);
 	this->_unhook();
-	if (!this->_disconnected) {
-		this->_connection->onDisconnect = nullptr;
+	if (!wasDisconnected) {
 		this->_connection->disconnect();
 	}
 	this->_menu->setActive();
@@ -981,6 +1014,11 @@ InLobbyMenu::~InLobbyMenu()
 		this->_connectThread.join();
 	if (this->_messageBoxThread.joinable())
 		this->_messageBoxThread.join();
+	for (unsigned i = 0; i < 3; ++i)
+		transferLobbyTexture(this->_battleStatus[i].texture, lobbyData->lobbyMenuTextureCache[i]);
+	transferLobbyTexture(this->_chatSeat.texture, lobbyData->lobbyMenuTextureCache[3]);
+	transferLobbyTexture(this->_messageBox.texture, lobbyData->lobbyMenuTextureCache[4]);
+	transferLobbyTexture(this->_loadingGear.texture, lobbyData->lobbyMenuTextureCache[5]);
 }
 
 void InLobbyMenu::_()
@@ -1484,6 +1522,14 @@ int InLobbyMenu::onProcess()
 
 int InLobbyMenu::onRender()
 {
+	struct RenderFlag {
+		bool &flag;
+		RenderFlag(bool &value) : flag(value) { flag = true; }
+		~RenderFlag() { flag = false; }
+	} renderFlag(this->_inLobbyRender);
+	// One shared start budget for names, bubbles, chat and optional menu labels.
+	this->_textureTimeRemaining = std::chrono::milliseconds(3);
+	this->_textureJobsRemaining = 4;
 	if (this->_disconnected)
 		return 0;
 	try {
@@ -1498,7 +1544,10 @@ int InLobbyMenu::onRender()
 			this->_loadingGear.draw();
 			return 0;
 		}
+		this->_textureDeadline = std::chrono::steady_clock::now() + this->_textureTimeRemaining;
 		this->_processPendingTextureWork();
+		this->_textureTimeRemaining = (std::max)(std::chrono::steady_clock::duration::zero(),
+			this->_textureDeadline - std::chrono::steady_clock::now());
 
 		auto &bg = lobbyData->backgrounds[this->_background];
 
@@ -2226,7 +2275,8 @@ void InLobbyMenu::_renderRelativeRatings()
 			return lines;
 		}
 		wchar_t score[96];
-		std::swprintf(score, 96, L"%.0f  \u00B1%.0f", rating.value, rating.deviation);
+		// Keep the API's raw RD in the cache; the displayed interval is +/-2 RD.
+		std::swprintf(score, 96, L"%.0f  \u00B1%.0f", rating.value, rating.deviation * 2.0);
 		lines.push_back(score);
 		for (const auto &character : rating.characters) {
 			wchar_t line[80];
@@ -2392,6 +2442,7 @@ void InLobbyMenu::_unhook()
 	this->_connection->onPlayerLeave = this->onPlayerLeave;
 	this->_connection->onArcadeEngage = this->onArcadeEngage;
 	this->_connection->onArcadeLeave = this->onArcadeLeave;
+	this->_connection->onDisconnect = this->onDisconnect;
 }
 
 void InLobbyMenu::_addMessageToList(unsigned int channel, unsigned player, const std::string &msg, std::optional<unsigned> colorOverride, bool autoPopup)
@@ -2473,6 +2524,7 @@ void InLobbyMenu::_buildPlayerName(unsigned player, const std::string &name)
 
 void InLobbyMenu::_processPendingTextureWork()
 {
+	LobbyPreparationTimer preparationTimer{"player-name-and-bubble-preparation"};
 	constexpr unsigned playerNamesPerFrame = 2;
 	constexpr unsigned textBubblesPerFrame = 2;
 	std::set<uint32_t> removals;
@@ -2484,32 +2536,13 @@ void InLobbyMenu::_processPendingTextureWork()
 		std::chrono::steady_clock::time_point receivedAt;
 	};
 	std::vector<TextBubbleWork> textBubbles;
+	bool bubbleFirst = false;
 	{
 		std::lock_guard<std::mutex> lock(this->_pendingTextureWorkMutex);
-		auto now = std::chrono::steady_clock::now();
-
+		// Alternating priority prevents a large join burst from starving bubbles.
+		bubbleFirst = this->_preferTextBubbles && !this->_pendingTextBubbleOrder.empty();
+		this->_preferTextBubbles = !this->_preferTextBubbles;
 		removals.swap(this->_pendingPlayerRemovals);
-		for (unsigned i = 0; i < playerNamesPerFrame && !this->_pendingPlayerNameOrder.empty();) {
-			auto player = this->_pendingPlayerNameOrder.front();
-			this->_pendingPlayerNameOrder.pop();
-			auto work = this->_pendingPlayerNames.find(player);
-			if (work == this->_pendingPlayerNames.end())
-				continue;
-			playerNames.emplace_back(work->first, std::move(work->second));
-			this->_pendingPlayerNames.erase(work);
-			i++;
-		}
-		for (unsigned i = 0; i < textBubblesPerFrame && !this->_pendingTextBubbleOrder.empty();) {
-			auto player = this->_pendingTextBubbleOrder.front();
-			this->_pendingTextBubbleOrder.pop();
-			auto work = this->_pendingTextBubbles.find(player);
-			if (work == this->_pendingTextBubbles.end())
-				continue;
-			if (now - work->second.receivedAt < TEXT_BUBBLE_LIFETIME)
-				textBubbles.push_back({work->first, std::move(work->second.message), work->second.privateMessage, work->second.receivedAt});
-			this->_pendingTextBubbles.erase(work);
-			i++;
-		}
 	}
 	if (!removals.empty()) {
 		{
@@ -2522,10 +2555,47 @@ void InLobbyMenu::_processPendingTextureWork()
 			this->_extraPlayerData.erase(player);
 		}
 	}
-	for (const auto &[player, name] : playerNames)
-		this->_buildPlayerName(player, name);
-	for (const auto &work : textBubbles)
-		this->_buildTextBubble(work.player, work.message, work.privateMessage, work.receivedAt);
+	// Leave the last millisecond for visible chat/menu text. Pop only work that
+	// will actually be executed; deferred jobs retain their FIFO order.
+	for (unsigned i = 0; !bubbleFirst && i < playerNamesPerFrame && this->_textureJobsRemaining &&
+		std::chrono::steady_clock::now() < this->_textureDeadline - std::chrono::milliseconds(1);) {
+		{
+			std::lock_guard<std::mutex> lock(this->_pendingTextureWorkMutex);
+			if (this->_pendingPlayerNameOrder.empty()) break;
+			auto player = this->_pendingPlayerNameOrder.front();
+			this->_pendingPlayerNameOrder.pop();
+			auto work = this->_pendingPlayerNames.find(player);
+			if (work == this->_pendingPlayerNames.end())
+				continue;
+			playerNames.emplace_back(work->first, std::move(work->second));
+			this->_pendingPlayerNames.erase(work);
+			i++;
+		}
+		--this->_textureJobsRemaining;
+		this->_buildPlayerName(playerNames.back().first, playerNames.back().second);
+	}
+	for (unsigned i = 0; i < textBubblesPerFrame && this->_textureJobsRemaining &&
+		std::chrono::steady_clock::now() < this->_textureDeadline - std::chrono::milliseconds(1);) {
+		{
+			std::lock_guard<std::mutex> lock(this->_pendingTextureWorkMutex);
+			if (this->_pendingTextBubbleOrder.empty()) break;
+			auto player = this->_pendingTextBubbleOrder.front();
+			this->_pendingTextBubbleOrder.pop();
+			auto work = this->_pendingTextBubbles.find(player);
+			if (work == this->_pendingTextBubbles.end())
+				continue;
+			if (std::chrono::steady_clock::now() - work->second.receivedAt < TEXT_BUBBLE_LIFETIME)
+				textBubbles.push_back({work->first, std::move(work->second.message), work->second.privateMessage, work->second.receivedAt});
+			this->_pendingTextBubbles.erase(work);
+			i++;
+		}
+		if (!textBubbles.empty()) {
+			--this->_textureJobsRemaining;
+			const auto &work = textBubbles.back();
+			this->_buildTextBubble(work.player, work.message, work.privateMessage, work.receivedAt);
+			textBubbles.clear();
+		}
+	}
 }
 
 void InLobbyMenu::_showEmoteBubble(unsigned player, const std::string &msg)
@@ -2954,27 +3024,10 @@ void InLobbyMenu::_updateRecentOpponent()
 
 void InLobbyMenu::_logChatToFile(unsigned player, const std::string &msg)
 {
-	static std::mutex logMutex;
 	if (player == 0)
 		return; // Skip system/notification lines; keep only user chat
 	try {
-		std::lock_guard<std::mutex> guard(logMutex);
-		auto dir = std::filesystem::path(profileFolderPath) / "chatlog";
-		std::filesystem::create_directories(dir);
-		auto now = std::chrono::system_clock::now();
-		auto tt = std::chrono::system_clock::to_time_t(now);
-		std::tm local{};
-		localtime_s(&local, &tt);
-		std::ostringstream filename;
-		filename << std::put_time(&local, "%Y-%m-%d") << ".txt";
-		std::string sanitized = msg;
-		for (auto &ch : sanitized)
-			if (ch == '\n' || ch == '\r')
-				ch = ' ';
-		std::ofstream out(dir / filename.str(), std::ios::app);
-		if (!out)
-			return;
-		out << std::put_time(&local, "%H:%M:%S") << " " << sanitized << "\n";
+		queueChatLog(std::filesystem::path(profileFolderPath), msg);
 	} catch (...) {
 	}
 }
@@ -3498,7 +3551,11 @@ void InLobbyMenu::_updateQuickMessageMenu()
 
 void InLobbyMenu::_initQuickMessageSprites()
 {
+	LobbyPreparationTimer preparationTimer{"quick-message-labels"};
 	for (unsigned i = 0; i < 9; i++) {
+		if (this->_quickMessageSprites[i].texture.hasTexture()) continue;
+		if (!this->_textureJobsRemaining || std::chrono::steady_clock::now() >= this->_textureDeadline) return;
+		--this->_textureJobsRemaining;
 		std::wstring label = std::to_wstring(i + 1) + L". " + (quickMessages[i].empty() ? L"(not configured)" : quickMessages[i]);
 		int textureId = 0;
 
@@ -3514,16 +3571,21 @@ void InLobbyMenu::_initQuickMessageSprites()
 		if (quickMessages[i].empty())
 			this->_quickMessageSprites[i].tint = SokuLib::Color{0x80, 0x80, 0x80, 0xFF};
 	}
+	this->_quickMessageSpritesReady = true;
 }
 
 void InLobbyMenu::_initChatPopupModeSprites()
 {
+	LobbyPreparationTimer preparationTimer{"popup-mode-labels"};
 	const wchar_t *labels[3] = {
 		chineseLanguage ? L"\u804A\u5929\u5F39\u51FA\uFF1A\u6240\u6709\u4EBA" : L"Chat popup: All players",
 		chineseLanguage ? L"\u804A\u5929\u5F39\u51FA\uFF1A\u4EC5\u5BF9\u6218\u73A9\u5BB6" : L"Chat popup: Battle players only",
 		chineseLanguage ? L"\u804A\u5929\u5F39\u51FA\uFF1A\u4ECE\u4E0D" : L"Chat popup: Never"
 	};
 	for (unsigned i = 0; i < 3; i++) {
+		if (this->_chatPopupModeSprites[i].texture.hasTexture()) continue;
+		if (!this->_textureJobsRemaining || std::chrono::steady_clock::now() >= this->_textureDeadline) return;
+		--this->_textureJobsRemaining;
 		int textureId = 0;
 		SokuLib::Vector2i size;
 		if (!createTextTexture(textureId, labels[i], this->_textBubbleFont, {300, 28}, &size, true))
@@ -3532,6 +3594,7 @@ void InLobbyMenu::_initChatPopupModeSprites()
 		this->_chatPopupModeSprites[i].rect = {0, 0, size.x, size.y};
 		this->_chatPopupModeSprites[i].setSize(size.to<unsigned>());
 	}
+	this->_chatPopupModeSpritesReady = true;
 }
 
 void InLobbyMenu::_initInputBox()
@@ -4232,6 +4295,23 @@ void InLobbyMenu::_sendEmote(const LobbyData::Emote &emote)
 
 void InLobbyMenu::updateChat(bool inGame)
 {
+	// Prune even while hidden, on the game thread so texture destruction is safe.
+	std::list<Message> retiredMessages;
+	{
+		std::lock_guard<std::mutex> lock(_chatMessagesMutex);
+		const auto limit = (std::max)(1u, (std::min)(maxChatMessages, 10000u));
+		while (_chatMessages.size() > limit) {
+			auto last = std::prev(_chatMessages.end());
+			retiredMessages.splice(retiredMessages.end(), _chatMessages, last);
+		}
+	}
+	// Host callbacks must execute on the game thread, not the message-box worker.
+	if (_connection->isInit() && _connection->getMe() && SokuLib::sceneId != SokuLib::SCENE_TITLE &&
+		_connection->getMe()->battleStatus == Lobbies::BATTLE_STATUS_WAITING) {
+		_connection->getMe()->battleStatus = Lobbies::BATTLE_STATUS_PLAYING;
+		Lobbies::PacketBattleStatusUpdate status{0, Lobbies::BATTLE_STATUS_PLAYING};
+		_connection->send(&status, sizeof(status)); _connection->sendGameInfo();
+	}
 	this->_connection->setSpectatingScene(
 		SokuLib::sceneId == SokuLib::SCENE_LOADINGWATCH ||
 		SokuLib::sceneId == SokuLib::SCENE_BATTLEWATCH ||
@@ -4334,6 +4414,12 @@ void InLobbyMenu::renderChat()
 {
 	if (this->_disconnected)
 		return;
+	// Battle/select scene hooks render chat without calling onRender().
+	if (!this->_inLobbyRender) {
+		this->_textureTimeRemaining = std::chrono::milliseconds(3);
+		this->_textureJobsRemaining = 4;
+	}
+	this->_textureDeadline = std::chrono::steady_clock::now() + this->_textureTimeRemaining;
 	if (this->_chatSeat.tint.a) {
 		this->_chatSeat.draw();
 		std::list<Message> chatMessagesToRemove;
@@ -4341,6 +4427,8 @@ void InLobbyMenu::renderChat()
 		std::lock_guard<std::mutex> lock(this->_chatMessagesMutex);
 	
 		auto remaining = this->_chatOffset;
+		unsigned texturesBuilt = 0;
+		LobbyPreparationTimer preparationTimer{"chat-text-preparation-and-render"};
 		SokuLib::Vector2i pos{292, 180};
 
 		for (auto it = this->_chatMessages.begin(); it != this->_chatMessages.end(); it++) {
@@ -4353,6 +4441,9 @@ void InLobbyMenu::renderChat()
 
 			// create sprites if they haven't been created
 			if (msg.lazy_message.has_value()) {
+				if (texturesBuilt >= 2 || !this->_textureJobsRemaining || std::chrono::steady_clock::now() >= this->_textureDeadline) break;
+				++texturesBuilt;
+				--this->_textureJobsRemaining;
 				auto m = it;
 				const bool preserveScrollAnchor = msg.preserveScrollAnchor && this->_chatOffset != 0;
 				unsigned generatedHeight = 0;
@@ -4379,9 +4470,11 @@ void InLobbyMenu::renderChat()
 					else if (msg.lazy_message->player == 0)
 						txt.sprite.tint = msg.lazy_message->channel;
 					//txt.sprite.texture.createFromText(line.c_str(), this->_chatFont, {350, 300}, &txt.realSize);
-					if (!createTextTexture(texId, convertEncoding<char, wchar_t, UTF8Decode, UTF16Encode>(line).c_str(), this->_chatFont, {350, 300}, &txt.realSize))
+					// Each fragment is a single line. The old 300px surface paid for
+					// ten times the pixels on every upload and shadow pass.
+					if (!createTextTexture(texId, convertEncoding<char, wchar_t, UTF8Decode, UTF16Encode>(line).c_str(), this->_chatFont, {350, 32}, &txt.realSize))
 						puts("Error creating text texture");
-					txt.sprite.texture.setHandle(texId, {350, 300});
+					txt.sprite.texture.setHandle(texId, {350, 32});
 					txt.sprite.rect.width = txt.realSize.x;
 					txt.sprite.rect.height = txt.realSize.y;
 					txt.pos.x = startPos;
@@ -4698,6 +4791,7 @@ void InLobbyMenu::_renderEmotePicker()
 
 void InLobbyMenu::_renderQuickMessageMenu()
 {
+	if (!this->_quickMessageSpritesReady) this->_initQuickMessageSprites();
 	constexpr int panelX = 132;
 	constexpr int panelY = 82;
 	constexpr int panelWidth = 376;
@@ -4711,6 +4805,7 @@ void InLobbyMenu::_renderQuickMessageMenu()
 	panel.setFillColor(SokuLib::Color{0x12, 0x16, 0x20, 0xE8});
 	panel.draw();
 	for (unsigned i = 0; i < 9; i++) {
+		if (!this->_quickMessageSprites[i].texture.hasTexture()) continue;
 		this->_quickMessageSprites[i].setPosition({
 			panelX + padding,
 			panelY + padding + static_cast<int>(i) * 31
@@ -4721,7 +4816,9 @@ void InLobbyMenu::_renderQuickMessageMenu()
 
 void InLobbyMenu::_renderChatPopupMode()
 {
+	if (!this->_chatPopupModeSpritesReady) this->_initChatPopupModeSprites();
 	auto &text = this->_chatPopupModeSprites[chatPopupMode];
+	if (!text.texture.hasTexture()) return;
 	unsigned char alpha = this->_chatPopupModeTimer > 30 ? 255 : static_cast<unsigned char>(this->_chatPopupModeTimer * 255 / 30);
 	constexpr int width = 316;
 	constexpr int height = 42;

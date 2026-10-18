@@ -9,6 +9,8 @@
 #include <atomic>
 #include <mutex>
 #include <thread>
+#include <deque>
+#include <unordered_map>
 #include <SokuLib.hpp>
 #include "Player.hpp"
 #include "Socket.hpp"
@@ -39,6 +41,8 @@ private:
 	};
 
 	Player _loadedSettings;
+	Player _connectionSettings;
+	std::mutex _settingsMutex;
 	std::mutex _connectionsMutex;
 	SokuLib::MenuConnect *_parent;
 	int _customCursor = 0;
@@ -48,6 +52,7 @@ private:
 	std::string _lastError;
 	Socket _mainServer;
 	std::vector<std::shared_ptr<Entry>> _connections;
+	std::vector<std::shared_ptr<Entry>> _retiredEntries;
 	unsigned char _menuState = 0;
 	std::atomic_bool _open = true;
 	bool _active = true;
@@ -72,7 +77,10 @@ private:
 	SokuLib::DrawUtils::Sprite _lock;
 	std::vector<AvatarShowcase> _showcases;
 	std::mutex _queueMutex;
-	std::vector<std::function<void ()>> _workerQueue;
+	std::deque<std::function<void ()>> _workerQueue;
+	std::unordered_map<const void *, std::function<void()>> _refreshQueue;
+	std::deque<const void *> _refreshOrder;
+	void _queueUi(std::function<void()> work, const void *refreshKey = nullptr);
 
 	void _netLoop();
 	void _masterServerLoop();

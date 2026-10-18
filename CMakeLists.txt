@@ -76,6 +76,25 @@ if (SFML_FOUND)
 	endif()
 endif()
 
+option(SOKULOBBIES_BUILD_CLIENT_TESTS "Build standalone client transport regression tests" OFF)
+if (SOKULOBBIES_BUILD_CLIENT_TESTS)
+	enable_testing()
+	add_executable(SokuLobbiesClientTests tests/ClientTransportTests.cpp src/Common/Socket.cpp src/SokuMod/ClientChatLog.cpp)
+	target_include_directories(SokuLobbiesClientTests PRIVATE src/SokuMod)
+	if (WIN32)
+		target_link_libraries(SokuLobbiesClientTests ws2_32)
+	endif()
+	if (CMAKE_CXX_COMPILER_ID STREQUAL "GNU" AND CMAKE_CXX_COMPILER_VERSION VERSION_LESS 9)
+		target_link_libraries(SokuLobbiesClientTests stdc++fs)
+	endif()
+	add_test(NAME ClientTransportRegression COMMAND SokuLobbiesClientTests)
+	set_tests_properties(ClientTransportRegression PROPERTIES TIMEOUT 20)
+	add_executable(SokuLobbiesStatsTests tests/CharacterGameStatsTests.cpp)
+	target_include_directories(SokuLobbiesStatsTests PRIVATE src/SokuMod)
+	add_test(NAME CharacterGameStatsRegression COMMAND SokuLobbiesStatsTests)
+	set_tests_properties(CharacterGameStatsRegression PROPERTIES TIMEOUT 20)
+endif()
+
 if ("${CMAKE_CXX_COMPILER_ID}" STREQUAL "MSVC")
 	add_definitions(-DWINVER=0x0600 -D_WIN32_WINNT=0x0600)
 	if (CMAKE_BUILD_TYPE STREQUAL Debug)
@@ -157,6 +176,10 @@ if ("${CMAKE_CXX_COMPILER_ID}" STREQUAL "MSVC")
 		src/SokuMod/IniConfig.cpp
 		src/SokuMod/IniConfig.hpp
 		src/SokuMod/InLobbyMenu.cpp
+		src/SokuMod/ClientChatLog.cpp
+		src/SokuMod/ClientChatLog.hpp
+		src/SokuMod/ClientTransport.hpp
+		src/SokuMod/CharacterGameStats.hpp
 		src/SokuMod/InLobbyMenu.cpp
 		src/SokuMod/getPublicIp.hpp
 		src/SokuMod/getPublicIp.cpp
@@ -191,7 +214,12 @@ if ("${CMAKE_CXX_COMPILER_ID}" STREQUAL "MSVC")
 	target_compile_options(SokuLobbiesMod PRIVATE /Zi /utf-8)
 	target_compile_definitions("SokuLobbiesMod" PRIVATE DIRECTINPUT_VERSION=0x0800 _CRT_SECURE_NO_WARNINGS)
 	option(SOKU_RATINGS_DIAGNOSTICS "Enable player rating diagnostic logs in any build configuration" OFF)
-	target_compile_definitions(SokuLobbiesMod PRIVATE $<$<OR:$<CONFIG:Debug>,$<BOOL:${SOKU_RATINGS_DIAGNOSTICS}>>:SOKU_RATINGS_DIAGNOSTICS=1>)
+	option(SOKU_RATINGS_NETWORK_PROBE "Run one-time rating HTTPS comparison probes after a transport failure" OFF)
+	target_sources(SokuLobbiesMod PRIVATE src/SokuMod/RatingsNetworkDiagnostics.cpp)
+	target_compile_definitions(SokuLobbiesMod PRIVATE
+		$<$<OR:$<CONFIG:Debug>,$<BOOL:${SOKU_RATINGS_DIAGNOSTICS}>,$<BOOL:${SOKU_RATINGS_NETWORK_PROBE}>>:SOKU_RATINGS_DIAGNOSTICS=1>
+		$<$<BOOL:${SOKU_RATINGS_NETWORK_PROBE}>:SOKU_RATINGS_NETWORK_PROBE=1>)
+	target_link_libraries(SokuLobbiesMod $<$<BOOL:${SOKU_RATINGS_NETWORK_PROBE}>:winhttp>)
 	target_link_libraries(
 		SokuLobbiesMod
 		SokuLib

@@ -107,6 +107,7 @@ private:
 	std::function<void (const Lobbies::PacketOlleh &)> onConnect;
 	std::function<void (const Player &, uint32_t id)> onArcadeEngage;
 	std::function<void (const Player &, uint32_t id)> onArcadeLeave;
+	std::function<void ()> onDisconnect;
 	SokuLib::Vector2i _translate{0, 0};
 	SokuLib::Vector2i _translateStep{0, 0};
 	SokuLib::Vector2i _translateTarget{0, 0};
@@ -123,7 +124,7 @@ private:
 	std::shared_ptr<Connection> _connection;
 	SokuLib::MenuConnect *_parent;
 	bool _wasConnected = false;
-	bool _disconnected = false;
+	std::atomic_bool _disconnected{false};
 	bool _serverBlocklistSupported = false;
 	std::vector<Player> _playersCopy;
 	std::unordered_map<uint32_t, const Player *> _playersById;
@@ -255,6 +256,13 @@ private:
 	bool _lobbyExitRequested = false;
 	bool _hostlistExitRequested = false;
 	SokuLib::DrawUtils::Sprite _quickMessageSprites[9];
+	bool _quickMessageSpritesReady = false;
+	bool _chatPopupModeSpritesReady = false;
+	std::chrono::steady_clock::time_point _textureDeadline{};
+	unsigned _textureJobsRemaining = 0;
+	bool _inLobbyRender = false;
+	bool _preferTextBubbles = false;
+	std::chrono::steady_clock::duration _textureTimeRemaining{};
 	SokuLib::Vector2i _quickMessageTextSizes[9];
 	SokuLib::DrawUtils::Sprite _chatPopupModeSprites[3];
 	unsigned _chatPopupModeTimer = 0;
@@ -355,7 +363,7 @@ public:
 	wchar_t keyBuffer[2] = {0, 0};
 	bool wineWorkaroundNeeded = false;
 
-	InLobbyMenu(LobbyMenu *menu, SokuLib::MenuConnect *parent, std::shared_ptr<Connection> &connection);
+	InLobbyMenu(LobbyMenu *menu, SokuLib::MenuConnect *parent, const std::shared_ptr<Connection> &connection);
 	~InLobbyMenu();
 	void _() override;
 	int onProcess() override;

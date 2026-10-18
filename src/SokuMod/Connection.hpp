@@ -16,11 +16,14 @@
 #include "Player.hpp"
 #include "Socket.hpp"
 #include "LobbyData.hpp"
+#include "ClientTransport.hpp"
+#include <memory>
+#include <condition_variable>
 
 #define PLAYER_H_SPEED 4
 #define PLAYER_V_SPEED 4
 
-class Connection {
+class Connection : public std::enable_shared_from_this<Connection> {
 public:
 	struct LobbyInfo {
 		std::string name;
@@ -32,15 +35,35 @@ public:
 private:
 	mutable std::mutex _messagesMutex;
 	mutable std::mutex _playerMutex;
-	std::mutex _infoMutex;
+	mutable std::mutex _infoMutex;
 	std::thread _netThread;
-	std::thread _posThread;
 	std::thread _connectThread;
+	std::thread _sendThread;
+	std::mutex _sendMutex;
+	std::condition_variable _sendReady;
+	std::deque<std::shared_ptr<std::vector<char>>> _outgoing;
+	size_t _outgoingBytes = 0;
+	ClientInbox _inbox;
+	std::mutex _sessionMutex;
+	std::deque<uint64_t> _helloSessions;
+	uint64_t _receiveSession = 0;
+	std::atomic<uint64_t> _session{1};
+	std::atomic_bool _helloPending{false};
+	std::atomic_bool _helloRequested{false};
+	std::mutex _errorMutex;
+	std::string _transportError;
+	bool _disconnectNotified = false;
+	bool _receivedKick = false;
+	std::mutex _heartbeatMutex;
+	Lobbies::PacketPosition _heartbeat{0, 0, 0, 0, Lobbies::BATTLE_STATUS_IDLE};
+	std::atomic_bool _heartbeatReady{false};
+	uint64_t _skippedChat = 0;
+	std::chrono::steady_clock::time_point _lastChatNotice{};
 	std::string _host;
 	unsigned short _port;
-	bool _hasConnected = false;
-	bool _connected = true;
-	bool _init = false;
+	std::atomic_bool _hasConnected{false};
+	std::atomic_bool _connected{true};
+	std::atomic_bool _init{false};
 	std::atomic_bool _spectatingArcade{false};
 	std::atomic_bool _spectatingScene{false};
 	std::atomic_llong _lastSpectatingAtMs{0};
@@ -48,7 +71,7 @@ private:
 	std::string _name;
 	Socket _socket;
 	LobbyInfo _info;
-	const Player &_initParams;
+	Player _initParams;
 	Player *_me = nullptr;
 	std::optional<std::string> _pwd;
 	std::map<uint32_t, uint32_t> _machines;
@@ -58,7 +81,11 @@ private:
 	static std::vector<std::function<void (Player &, const LobbyData::Avatar &)>> _playerUpdateHandles;
 
 	void _netLoop();
-	void _posLoop();
+	void _sendLoop();
+	void _failTransport(const std::string &reason);
+	void _publishHeartbeat();
+	void _queueHeartbeat();
+	void _pumpEvents(std::chrono::steady_clock::time_point deadline);
 	bool _handlePacket(const Lobbies::Packet &packet, size_t &size);
 	bool _handlePacket(const Lobbies::PacketHello &packet, size_t &size);
 	bool _handlePacket(const Lobbies::PacketOlleh &packet, size_t &size);
@@ -97,6 +124,7 @@ public:
 	~Connection();
 	void startThread();
 	void setPassword(const std::string &pwd);
+	void setInitialPlayer(const Player &player); // Game thread, before requesting HELLO.
 	void error(const std::string &msg);
 	void connect();
 	void disconnect();
@@ -112,6 +140,9 @@ public:
 	std::vector<std::string> getMessages() const;
 	void updatePlayers(const std::vector<LobbyData::Avatar> &avatars);
 	void setSpectatingScene(bool spectating);
+	static void pumpNetworkEvents();
+private:
+	void _sendHello();
 };
 
 

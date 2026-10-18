@@ -45,6 +45,9 @@ private:
 	mutable std::vector<std::string> _pendingProfiles;
 	mutable std::unordered_map<std::string, std::uint64_t> _profileChecked;
 	std::unordered_map<std::string, std::string> _profileHandles;
+#ifdef SOKU_RATINGS_NETWORK_PROBE
+	bool _networkProbeDone = false; // Worker thread only.
+#endif
 
 	void _run();
 	void _debugLog(const std::string &message) const;
