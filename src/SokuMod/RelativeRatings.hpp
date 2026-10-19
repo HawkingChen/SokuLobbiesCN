@@ -36,6 +36,8 @@ private:
 	std::thread _worker;
 	std::atomic_bool _enabled{false};
 	std::atomic_bool _stopping{false};
+	std::atomic_bool _workerFailed{false};
+	mutable std::atomic_ullong _lastInvalidNameLogAt{0};
 	std::unordered_map<std::string, Rating> _byPlayedAs;
 	std::unordered_map<std::string, Rating> _byName;
 	std::unordered_map<std::string, Rating> _byHandle;
@@ -50,6 +52,7 @@ private:
 #endif
 
 	void _run();
+	void _runGuarded() noexcept;
 	void _debugLog(const std::string &message) const;
 	void _loadMappings();
 	void _downloadProfiles(const std::vector<std::string> &profiles);

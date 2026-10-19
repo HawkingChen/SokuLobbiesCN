@@ -124,12 +124,15 @@ private:
 	std::shared_ptr<Connection> _connection;
 	SokuLib::MenuConnect *_parent;
 	bool _wasConnected = false;
+	bool _callbacksInstalled = false;
+	std::atomic_bool _messageBoxStop{false};
+	ClientArcadeMembership _arcadeMembership;
 	std::atomic_bool _disconnected{false};
 	bool _serverBlocklistSupported = false;
 	std::vector<Player> _playersCopy;
 	std::unordered_map<uint32_t, const Player *> _playersById;
 	std::unordered_set<uint32_t> _playersInsideElevator;
-	unsigned _chatTimer = 0;
+	std::atomic_uint _chatTimer{0};
 	unsigned _chatOffset = 0;
 	std::atomic_bool _chatScrolledAwayFromBottom{false};
 	std::atomic_bool _battleOpponentChatPopup{false};
@@ -303,6 +306,10 @@ private:
 	void _queuePlayerRemoval(unsigned player);
 	void _buildPlayerName(unsigned player, const std::string &name);
 	void _processPendingTextureWork();
+	void _samplePerformance() noexcept;
+	void _returnCachedTextures();
+	void _finishShutdown() noexcept;
+	void _refreshMachineOccupancy(unsigned id);
 	void _logChatToFile(unsigned player, const std::string &msg);
 	void _inputBoxUpdate(bool blockChatInput);
 	void _processHotkeyEvents();
@@ -347,6 +354,9 @@ private:
 	void _updateRelativeRatingTarget();
 	void _renderRelativeRatings();
 	void _startHosting();
+	void _connectLoop();
+	void _messageBoxLoop();
+	void _runWorker(void (InLobbyMenu::*work)(), const char *label) noexcept;
 	void _updateCompositionSprite();
 	void _openMessageBox(int sound, const std::string &text, const std::string &title, UINT type);
 	int _getTextSize(unsigned i);

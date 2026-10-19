@@ -31,6 +31,8 @@
 #include "Blocklist.hpp"
 #include "IniConfig.hpp"
 #include "InputBox.hpp"
+#include "Utf8Name.hpp"
+#include "ClientPerformance.hpp"
 
 #define CHAT_CHARACTER_LIMIT 512
 #define BOX_TEXTURE_SIZE {0x2000, 30}
@@ -77,6 +79,10 @@ namespace {
 		const char *label;
 		std::chrono::steady_clock::time_point started = std::chrono::steady_clock::now();
 		~LobbyPreparationTimer() noexcept {
+#ifdef SOKU_CLIENT_PERFORMANCE
+			// The diagnostic build uses the asynchronous aggregate logger instead.
+			return;
+#endif
 			try {
 				const auto elapsed = std::chrono::steady_clock::now() - started;
 				if (elapsed < std::chrono::milliseconds(4)) return;
@@ -290,7 +296,7 @@ static bool naturalAliasLess(const std::string &left, const std::string &right)
 	return left.size() < right.size();
 }
 
-static LRESULT __stdcall Hooked_WndProc(const HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
+static std::optional<LRESULT> handleLobbyWindowMessage(const HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
 {
 	if (
 		uMsg == WM_IME_NOTIFY &&
@@ -315,20 +321,18 @@ static LRESULT __stdcall Hooked_WndProc(const HWND hWnd, UINT uMsg, WPARAM wPara
 	const size_t size = sizeof(eventList) / sizeof(*eventList);
 
 	if (std::find(eventList, eventList + size, uMsg) == eventList + size)
-		return CallWindowProc(Original_WndProc, hWnd, uMsg, wParam, lParam);
+		return std::nullopt;
 	if (uMsg == WM_IME_NOTIFY) {
 		if (wParam == IMN_SETCONVERSIONMODE) {
-			ptrMutex.lock();
+			std::lock_guard<std::mutex> pointerLock(ptrMutex);
 			if (!activeMenu) {
-				ptrMutex.unlock();
-				return CallWindowProc(Original_WndProc, hWnd, uMsg, wParam, lParam);
+				return std::nullopt;
 			}
 			if (activeMenu->immCtx)
 				ImmReleaseContext(hWnd, activeMenu->immCtx);
 			activeMenu->immCtx = nullptr;
 			activeMenu->immComposition.clear();
 			activeMenu->compositionCursor = 0;
-			ptrMutex.unlock();
 		} else if (wineVersion && (wParam == 0xf || wParam == 0x10))
 			//#define IMN_WINE_SET_OPEN_STATUS  0x000f
 			//#define IMN_WINE_SET_COMP_STRING  0x0010
@@ -337,12 +341,11 @@ static LRESULT __stdcall Hooked_WndProc(const HWND hWnd, UINT uMsg, WPARAM wPara
 			// But th123 doesn't call DefWindowProc when processing WM_IME_NOTIFY.
 			return DefWindowProc(hWnd, uMsg, wParam, lParam);
 
-		return CallWindowProc(Original_WndProc, hWnd, uMsg, wParam, lParam);
+		return std::nullopt;
 	}
-	ptrMutex.lock();
+	std::lock_guard<std::mutex> pointerLock(ptrMutex);
 	if (!activeMenu) {
-		ptrMutex.unlock();
-		return CallWindowProc(Original_WndProc, hWnd, uMsg, wParam, lParam);
+		return std::nullopt;
 	}
 	if (uMsg == WM_KILLFOCUS) {
 		activeMenu->onInputFocusLost();
@@ -362,8 +365,7 @@ static LRESULT __stdcall Hooked_WndProc(const HWND hWnd, UINT uMsg, WPARAM wPara
 			compositionMsg.message == WM_IME_COMPOSITION &&
 			(compositionMsg.lParam & GCS_RESULTSTR)
 		) {
-			ptrMutex.unlock();
-			return CallWindowProc(Original_WndProc, hWnd, uMsg, wParam, lParam);
+			return std::nullopt;
 		}
 		if (activeMenu->immCtx)
 			ImmReleaseContext(hWnd, activeMenu->immCtx);
@@ -386,8 +388,7 @@ static LRESULT __stdcall Hooked_WndProc(const HWND hWnd, UINT uMsg, WPARAM wPara
 		if (!activeMenu->immCtx)
 			activeMenu->immCtx = ImmGetContext(hWnd);
 		if (!activeMenu->immCtx) {
-			ptrMutex.unlock();
-			return CallWindowProc(Original_WndProc, hWnd, uMsg, wParam, lParam);
+			return std::nullopt;
 		}
 
 		activeMenu->onKeyReleased();
@@ -469,9 +470,15 @@ static LRESULT __stdcall Hooked_WndProc(const HWND hWnd, UINT uMsg, WPARAM wPara
 		activeMenu->onWindowKeyEvent(static_cast<unsigned>(wParam), false, false);
 		activeMenu->onKeyReleased();
 	}
+	return std::nullopt;
+}
 
-	ptrMutex.unlock();
-	return CallWindowProc(Original_WndProc, hWnd, uMsg, wParam, lParam);
+static LRESULT __stdcall Hooked_WndProc(const HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
+{
+	auto result = runClientWindowCallback("lobby input", [&] { return handleLobbyWindowMessage(hWnd, uMsg, wParam, lParam); });
+	if (result) return *result;
+	return Original_WndProc ? CallWindowProc(Original_WndProc, hWnd, uMsg, wParam, lParam)
+		: DefWindowProc(hWnd, uMsg, wParam, lParam);
 }
 
 bool isNumber(const std::string &str)
@@ -529,6 +536,11 @@ InLobbyMenu::InLobbyMenu(LobbyMenu *menu, SokuLib::MenuConnect *parent, const st
 	_menu(menu)
 {
 	LobbyPreparationTimer preparationTimer{"lobby-constructor"};
+	ClientConstructionGuard rollback([this]() noexcept {
+		_disconnected = true;
+		_messageBoxStop = true;
+		_finishShutdown();
+	});
 	SokuLib::FontDescription desc;
 	bool hasEnglishPatch = (*(int *)0x411c64 == 1);
 
@@ -645,6 +657,9 @@ InLobbyMenu::InLobbyMenu(LobbyMenu *menu, SokuLib::MenuConnect *parent, const st
 	this->onPlayerJoin = this->_connection->onPlayerJoin;
 	this->onPlayerLeave = this->_connection->onPlayerLeave;
 	this->onDisconnect = this->_connection->onDisconnect;
+	this->onArcadeEngage = this->_connection->onArcadeEngage;
+	this->onArcadeLeave = this->_connection->onArcadeLeave;
+	this->_callbacksInstalled = true;
 	this->_connection->onDisconnect = [this]{
 		this->_disconnected = true;
 	};
@@ -657,6 +672,10 @@ InLobbyMenu::InLobbyMenu(LobbyMenu *menu, SokuLib::MenuConnect *parent, const st
 		this->_queuePlayerName(r.id, r.name);
 	};
 	this->_connection->onPlayerLeave = [this](const Player &r){
+		if (auto machine = _arcadeMembership.machineOf(r.id)) {
+			_arcadeMembership.leave(r.id, *machine);
+			_refreshMachineOccupancy(*machine);
+		}
 		{
 			std::lock_guard<std::mutex> lock(this->_recentOpponentMutex);
 			if (this->_recentOpponent && this->_recentOpponent->playerName == r.name) {
@@ -668,7 +687,13 @@ InLobbyMenu::InLobbyMenu(LobbyMenu *menu, SokuLib::MenuConnect *parent, const st
 		this->_queuePlayerRemoval(r.id);
 	};
 	this->_connection->onConnect = [this](const Lobbies::PacketOlleh &r){
+		if (!lobbyData || !validClientIndex(r.bg, lobbyData->backgrounds.size()))
+			throw std::runtime_error(chineseLanguage ? "大厅背景编号无效，请检查客户端素材版本。" : "Invalid lobby background; check the client assets version.");
 		auto &bg = lobbyData->backgrounds[r.bg];
+		if (!validClientIndex(static_cast<size_t>(bg.startPlatform), bg.platforms.size()) ||
+			(!bg.arcades.empty() && lobbyData->arcades.skins.size() < 2) ||
+			(!bg.elevators.empty() && lobbyData->elevators.empty()))
+			throw std::runtime_error(chineseLanguage ? "大厅背景素材不完整。" : "Incomplete lobby background assets.");
 		int id = 0;
 
 		this->_machines.reserve(bg.arcades.size());
@@ -891,58 +916,40 @@ InLobbyMenu::InLobbyMenu(LobbyMenu *menu, SokuLib::MenuConnect *parent, const st
 	this->_connection->onArcadeEngage = [this](const Player &p, uint32_t id){
 		if (id >= this->_machines.size() - 1)
 			return;
-
-		auto &machine = this->_machines[id];
-
-		machine.mutex.lock();
-		machine.playerCount++;
-		if (machine.playerCount == 1) {
-			machine.animation = 0;
-			machine.animationCtr = 0;
-			machine.animIdle = false;
-			machine.currentAnim = &lobbyData->arcades.select;
-			if (&p == this->_connection->getMe()) {
-				printf("Host pref %x\n", p.settings.hostPref);
-				if (p.settings.hostPref & Lobbies::HOSTPREF_ACCEPT_HOSTLIST)
-					this->_startHosting();
-			}
-		} else if (machine.playerCount == 2) {
-			machine.animation = 0;
-			machine.animationCtr = 0;
-			machine.animIdle = false;
-			machine.currentAnim = &lobbyData->arcades.game[random() % lobbyData->arcades.game.size()];
-		}
-		machine.mutex.unlock();
+		const auto previous = _arcadeMembership.machineOf(p.id);
+		if (!_arcadeMembership.enter(p.id, id)) return;
+		if (previous) _refreshMachineOccupancy(*previous);
+		_refreshMachineOccupancy(id);
+		if (this->_machines[id].playerCount == 1 && &p == this->_connection->getMe() &&
+			(p.settings.hostPref & Lobbies::HOSTPREF_ACCEPT_HOSTLIST))
+			this->_startHosting();
 	};
 	this->_connection->onArcadeLeave = [this](const Player &p, uint32_t id){
-		if (p.id == this->_connection->getMe()->id) {
+		auto me = this->_connection->getMe();
+		if (me && p.id == me->id) {
 			Lobbies::PacketBattleStatusUpdate packet{0, Lobbies::BATTLE_STATUS_IDLE};
 
 			this->_currentMachine = nullptr;
 			this->_connection->getMe()->battleStatus = Lobbies::BATTLE_STATUS_IDLE;
 			this->_connection->send(&packet, sizeof(packet));
 		}
-		if (id >= this->_machines.size() - 1)
+		if (id >= this->_machines.size() - 1 || !_arcadeMembership.leave(p.id, id))
 			return;
-
-		auto &machine = this->_machines[id];
-
-		machine.mutex.lock();
-		machine.playerCount--;
-		if (machine.playerCount == 1) {
-			machine.animation = 0;
-			machine.animationCtr = 0;
-			machine.animIdle = false;
-			machine.currentAnim = &lobbyData->arcades.select;
-		} else if (machine.playerCount == 0) {
-			machine.animIdle = true;
-			machine.animationCtr = 0;
-			machine.currentAnim = &lobbyData->arcades.intro;
-			machine.animation = machine.currentAnim->frameCount - 1;
-		}
-		machine.mutex.unlock();
+		_refreshMachineOccupancy(id);
 	};
-	this->_connectThread = std::thread{[this](){
+	this->_connectThread = std::thread(&InLobbyMenu::_runWorker, this, &InLobbyMenu::_connectLoop, "join retry");
+	{
+		std::lock_guard<std::mutex> pointerLock(ptrMutex);
+		activeMenu = this;
+	}
+	this->_messageBoxThread = std::thread(&InLobbyMenu::_runWorker, this, &InLobbyMenu::_messageBoxLoop, "message box");
+	if (!Original_WndProc)
+		Original_WndProc = (WNDPROC) SetWindowLongPtr(SokuLib::window, GWL_WNDPROC, (LONG_PTR) Hooked_WndProc);
+	rollback.dismiss();
+}
+
+void InLobbyMenu::_connectLoop()
+{
 		for (int i = 0; i < lobbyJoinTries; i++) {
 			if (this->_disconnected)
 				return;
@@ -957,22 +964,23 @@ InLobbyMenu::InLobbyMenu(LobbyMenu *menu, SokuLib::MenuConnect *parent, const st
 		}
 		if (!_disconnected && !_connection->isInit() && _connection->isConnected())
 			_connection->error("Failed to join lobby: Connection timed out.");
-	}};
-	ptrMutex.lock();
-	activeMenu = this;
-	ptrMutex.unlock();
-	this->_messageBoxThread = std::thread{[this](){
+}
+
+void InLobbyMenu::_messageBoxLoop()
+{
 		for (;; std::this_thread::sleep_for(std::chrono::milliseconds(100))) {
 			// * (char *)0x0089FFDC: is Soku still running
 			if (!*(char *)0x0089FFDC)
 				return;
-			if (SokuLib::sceneId == SokuLib::SCENE_BATTLECL || SokuLib::sceneId == SokuLib::SCENE_BATTLESV)
+			if (SokuLib::sceneId == SokuLib::SCENE_BATTLECL || SokuLib::sceneId == SokuLib::SCENE_BATTLESV) {
+				if (_messageBoxStop) return;
 				continue;
+			}
 
 			std::lock_guard<std::mutex> messageBoxMutexGuard(this->_messageBoxQueueMutex);
 
 			if (this->_messageBoxQueue.empty()) {
-				if (activeMenu)
+				if (!_messageBoxStop)
 					continue;
 				else
 					break;
@@ -982,38 +990,84 @@ InLobbyMenu::InLobbyMenu(LobbyMenu *menu, SokuLib::MenuConnect *parent, const st
 			MessageBoxW(SokuLib::window, args.text.c_str(), args.title.c_str(), args.type);
 			this->_messageBoxQueue.pop();
 		}
-	}};
-	if (!Original_WndProc)
-		Original_WndProc = (WNDPROC) SetWindowLongPtr(SokuLib::window, GWL_WNDPROC, (LONG_PTR) Hooked_WndProc);
+}
+
+void InLobbyMenu::_runWorker(void (InLobbyMenu::*work)(), const char *label) noexcept
+{
+	runClientWorker([&] { (this->*work)(); }, [label](const char *reason) {
+		fprintf(stderr, "Lobby %s worker failed: %s\n", label, reason);
+	}, [this]() noexcept {
+		_disconnected = true;
+		_messageBoxStop = true;
+	});
 }
 
 InLobbyMenu::~InLobbyMenu()
 {
-	const bool wasDisconnected = _disconnected.exchange(true);
+	_disconnected = true;
+	_messageBoxStop = true;
+	ClientConstructionGuard cleanup([this]() noexcept { _finishShutdown(); });
+	runClientCleanup("unpublish lobby menu", [this] {
+		std::lock_guard<std::mutex> lock(ptrMutex);
+		if (activeMenu == this) activeMenu = nullptr;
+	});
 	if (this->_hostlist)
 		this->_hostlist->requestStop();
 	for (auto &hostlist : this->_retiredHostlists)
 		hostlist->requestStop();
-	this->_saveRecentOpponent(true);
-	this->_saveRecentPlayerSelections();
-	ptrMutex.lock();
-	activeMenu = nullptr;
-	ptrMutex.unlock();
-	if (this->immCtx)
-		ImmReleaseContext(SokuLib::window, this->immCtx);
-	this->_unhook();
-	if (!wasDisconnected) {
-		this->_connection->disconnect();
+	runClientCleanup("save recent opponent", [this] { _saveRecentOpponent(true); });
+	runClientCleanup("save recent selections", [this] { _saveRecentPlayerSelections(); });
+	runClientCleanup("release lobby IME", [this] {
+		if (immCtx) ImmReleaseContext(SokuLib::window, immCtx);
+		immCtx = nullptr;
+	});
+	runClientCleanup("restore lobby list", [this] {
+		_menu->setActive();
+		if (!_music.empty()) SokuLib::playBGM("data/bgm/op2.ogg");
+	});
+}
+
+void InLobbyMenu::_finishShutdown() noexcept
+{
+	runClientCleanup("unpublish lobby menu", [this] {
+		std::lock_guard<std::mutex> lock(ptrMutex);
+		if (activeMenu == this) activeMenu = nullptr;
+	});
+	runClientCleanup("restore lobby callbacks", [this] { _unhook(); });
+	// Do not leave a pending HELLO behind after cancelling menu construction.
+	runClientCleanup("leave lobby", [this] { _connection->disconnect(); });
+	runClientCleanup("host thread join", [this] { if (_hostThread.joinable()) _hostThread.join(); });
+	runClientCleanup("join retry thread join", [this] { if (_connectThread.joinable()) _connectThread.join(); });
+	runClientCleanup("message box thread join", [this] { if (_messageBoxThread.joinable()) _messageBoxThread.join(); });
+	runClientCleanup("return lobby textures", [this] { _returnCachedTextures(); });
+}
+
+void InLobbyMenu::_refreshMachineOccupancy(unsigned id)
+{
+	if (id >= _machines.size()) return;
+	auto &machine = _machines[id];
+	std::lock_guard<std::mutex> lock(machine.mutex);
+	const auto previous = machine.playerCount;
+	machine.playerCount = _arcadeMembership.count(id);
+	if (previous == machine.playerCount) return;
+	if (machine.playerCount == 0) {
+		machine.animIdle = true;
+		machine.animationCtr = 0;
+		machine.currentAnim = &lobbyData->arcades.intro;
+		machine.animation = machine.currentAnim->frameCount ? machine.currentAnim->frameCount - 1 : 0;
+	} else if (machine.playerCount == 1 || previous < 2) {
+		machine.animation = 0;
+		machine.animationCtr = 0;
+		machine.animIdle = false;
+		machine.currentAnim = &lobbyData->arcades.select;
+		if (machine.playerCount >= 2 && !lobbyData->arcades.game.empty())
+			machine.currentAnim = &lobbyData->arcades.game[random() % lobbyData->arcades.game.size()];
 	}
-	this->_menu->setActive();
-	if (!this->_music.empty())
-		SokuLib::playBGM("data/bgm/op2.ogg");
-	if (this->_hostThread.joinable())
-		this->_hostThread.join();
-	if (this->_connectThread.joinable())
-		this->_connectThread.join();
-	if (this->_messageBoxThread.joinable())
-		this->_messageBoxThread.join();
+}
+
+void InLobbyMenu::_returnCachedTextures()
+{
+	if (!lobbyData) return;
 	for (unsigned i = 0; i < 3; ++i)
 		transferLobbyTexture(this->_battleStatus[i].texture, lobbyData->lobbyMenuTextureCache[i]);
 	transferLobbyTexture(this->_chatSeat.texture, lobbyData->lobbyMenuTextureCache[3]);
@@ -1048,6 +1102,7 @@ void InLobbyMenu::_()
 
 int InLobbyMenu::onProcess()
 {
+	ClientPerformance::Scope performance(ClientPerformance::Stage::LobbyUpdate);
 	this->_retiredHostlists.erase(std::remove_if(
 		this->_retiredHostlists.begin(),
 		this->_retiredHostlists.end(),
@@ -1522,6 +1577,8 @@ int InLobbyMenu::onProcess()
 
 int InLobbyMenu::onRender()
 {
+	ClientPerformance::Scope performance(ClientPerformance::Stage::LobbyRender);
+	_samplePerformance();
 	struct RenderFlag {
 		bool &flag;
 		RenderFlag(bool &value) : flag(value) { flag = true; }
@@ -1954,7 +2011,7 @@ int InLobbyMenu::onRender()
 					}
 				#endif
 					avatar.sprite.draw();
-					if (player.battleStatus) {
+					if (validClientBattleStatus(player.battleStatus) && player.battleStatus != Lobbies::BATTLE_STATUS_IDLE) {
 						auto &status = this->_battleStatus[player.battleStatus - 1];
 
 						status.setSize((status.texture.getSize() * this->_zoom).to<unsigned>());
@@ -1979,6 +2036,8 @@ int InLobbyMenu::onRender()
 			}
 		}
 
+		{
+		ClientPerformance::Scope namesPerformance(ClientPerformance::Stage::NameRender);
 		struct NamePlacement {
 			float minX;
 			float maxX;
@@ -2082,8 +2141,12 @@ int InLobbyMenu::onRender()
 				}
 			}
 		}
+		}
+		{
+		ClientPerformance::Scope bubblesPerformance(ClientPerformance::Stage::BubbleRender);
 		this->_renderTextBubbles(this->_playersById);
 		this->_renderEmoteBubbles(this->_playersById);
+		}
 		this->_renderRelativeRatings();
 		this->_translate = oldTranslate;
 		if (this->_currentMachine)
@@ -2239,6 +2302,7 @@ void InLobbyMenu::_updateRelativeRatingTarget()
 
 void InLobbyMenu::_renderRelativeRatings()
 {
+	ClientPerformance::Scope performance(ClientPerformance::Stage::RatingCards);
 	if (!relativeRatingsEnabled || !lobbyData)
 		return;
 	const auto me = this->_connection->getMe();
@@ -2265,7 +2329,7 @@ void InLobbyMenu::_renderRelativeRatings()
 	auto makeLines = [&](const Player &player, bool own) {
 		std::vector<std::wstring> lines;
 		RelativeRatings::Rating rating;
-		const auto playerName = convertEncoding<char, wchar_t, UTF8Decode, UTF16Encode>(player.name);
+		const auto playerName = convertEncoding<char, wchar_t, UTF8Decode, UTF16Encode>(ClientNames::displayName(player.name));
 		lines.push_back(playerName);
 		if (!lobbyData->relativeRatings().lookup(player.name, rating)) {
 			if (!lobbyData->relativeRatings().hasData())
@@ -2431,18 +2495,20 @@ void InLobbyMenu::_renderRelativeRatings()
 
 void InLobbyMenu::_unhook()
 {
+	if (!_callbacksInstalled) return;
 	std::lock_guard<std::mutex> functionMutexGuard(this->_connection->functionMutex);
-	this->_connection->onConnectRequest = this->onConnectRequest;
-	this->_connection->onError = this->onError;
-	this->_connection->onImpMsg = this->onImpMsg;
-	this->_connection->onMsg = this->onMsg;
-	this->_connection->onHostRequest = this->onHostRequest;
-	this->_connection->onConnect = this->onConnect;
-	this->_connection->onPlayerJoin = this->onPlayerJoin;
-	this->_connection->onPlayerLeave = this->onPlayerLeave;
-	this->_connection->onArcadeEngage = this->onArcadeEngage;
-	this->_connection->onArcadeLeave = this->onArcadeLeave;
-	this->_connection->onDisconnect = this->onDisconnect;
+	this->_connection->onConnectRequest.swap(this->onConnectRequest);
+	this->_connection->onError.swap(this->onError);
+	this->_connection->onImpMsg.swap(this->onImpMsg);
+	this->_connection->onMsg.swap(this->onMsg);
+	this->_connection->onHostRequest.swap(this->onHostRequest);
+	this->_connection->onConnect.swap(this->onConnect);
+	this->_connection->onPlayerJoin.swap(this->onPlayerJoin);
+	this->_connection->onPlayerLeave.swap(this->onPlayerLeave);
+	this->_connection->onArcadeEngage.swap(this->onArcadeEngage);
+	this->_connection->onArcadeLeave.swap(this->onArcadeLeave);
+	this->_connection->onDisconnect.swap(this->onDisconnect);
+	_callbacksInstalled = false;
 }
 
 void InLobbyMenu::_addMessageToList(unsigned int channel, unsigned player, const std::string &msg, std::optional<unsigned> colorOverride, bool autoPopup)
@@ -2496,7 +2562,7 @@ void InLobbyMenu::_buildPlayerName(unsigned player, const std::string &name)
 	std::wstring decoded;
 
 	try {
-		decoded = convertEncoding<char, wchar_t, UTF8Decode, UTF16Encode>(name);
+		decoded = convertEncoding<char, wchar_t, UTF8Decode, UTF16Encode>(ClientNames::displayName(name));
 	} catch (...) {
 		return;
 	}
@@ -2522,8 +2588,46 @@ void InLobbyMenu::_buildPlayerName(unsigned player, const std::string &name)
 	sprite.rect.height = size.y;
 }
 
+void InLobbyMenu::_samplePerformance() noexcept
+{
+#ifdef SOKU_CLIENT_PERFORMANCE
+	static uint64_t last = 0;
+	if (!ClientPerformance::snapshotDue(last)) return;
+	ClientPerformance::Scope performance(ClientPerformance::Stage::Snapshot);
+	try {
+		using G = ClientPerformance::Gauge;
+		ClientPerformance::gauge(G::Players, _playersCopy.size());
+		ClientPerformance::gauge(G::NameTextures, _extraPlayerData.size());
+		ClientPerformance::gauge(G::TextBubbles, _playerTextBubbles.size());
+		ClientPerformance::gauge(G::RatingCards, _relativeRatingCards.size());
+		size_t textures = 0;
+		for (const auto &card : _relativeRatingCards) textures += card.second.lines.size();
+		ClientPerformance::gauge(G::RatingTextures, textures);
+		{
+			std::lock_guard<std::mutex> lock(_chatMessagesMutex);
+			ClientPerformance::gauge(G::ChatMessages, _chatMessages.size());
+			size_t fragments = 0; for (const auto &message : _chatMessages) fragments += message.text.size();
+			ClientPerformance::gauge(G::ChatFragments, fragments);
+		}
+		{
+			std::lock_guard<std::mutex> lock(_pendingTextureWorkMutex);
+			ClientPerformance::gauge(G::PendingNames, _pendingPlayerNames.size());
+			ClientPerformance::gauge(G::PendingBubbles, _pendingTextBubbles.size());
+			ClientPerformance::gauge(G::PendingRemovals, _pendingPlayerRemovals.size());
+			ClientPerformance::gauge(G::PendingNameQueue, _pendingPlayerNameOrder.size());
+			ClientPerformance::gauge(G::PendingBubbleQueue, _pendingTextBubbleOrder.size());
+		}
+		{
+			std::lock_guard<std::mutex> lock(_playerEmoteBubblesMutex);
+			ClientPerformance::gauge(G::EmoteBubbles, _playerEmoteBubbles.size());
+		}
+	} catch (...) {}
+#endif
+}
+
 void InLobbyMenu::_processPendingTextureWork()
 {
+	ClientPerformance::Scope performance(ClientPerformance::Stage::TextureWork);
 	LobbyPreparationTimer preparationTimer{"player-name-and-bubble-preparation"};
 	constexpr unsigned playerNamesPerFrame = 2;
 	constexpr unsigned textBubblesPerFrame = 2;
@@ -3036,7 +3140,7 @@ void InLobbyMenu::onKeyPressed(unsigned chr)
 {
 	if (chr == 0x7F || chr < 32 || !this->_editingText || this->_battleChatAwaitRelease)
 		return;
-	this->_textMutex.lock();
+	std::unique_lock<std::mutex> textLock(this->_textMutex);
 	if (this->_hasSelection())
 		this->_deleteSelection();
 	if (this->_lastPressed && this->_textTimer == 0) {
@@ -3053,12 +3157,12 @@ void InLobbyMenu::onKeyPressed(unsigned chr)
 	}
 	this->_lastPressed = chr;
 	this->_textTimer = 0;
-	this->_textMutex.unlock();
+	textLock.unlock();
 }
 
 void InLobbyMenu::onKeyReleased()
 {
-	this->_textMutex.lock();
+	std::unique_lock<std::mutex> textLock(this->_textMutex);
 	if (this->_hasSelection())
 		this->_deleteSelection();
 	if (this->_lastPressed && this->_textTimer == 0) {
@@ -3075,11 +3179,12 @@ void InLobbyMenu::onKeyReleased()
 	}
 	this->_lastPressed = 0;
 	this->_textTimer = 0;
-	this->_textMutex.unlock();
+	textLock.unlock();
 }
 
 void InLobbyMenu::_inputBoxUpdate(bool blockChatInput)
 {
+	std::unique_lock<std::mutex> textLock(this->_textMutex, std::defer_lock);
 	if (GetForegroundWindow() != SokuLib::window) {
 		this->_battleChatHolding = false;
 		this->_battleChatHintUntil = {};
@@ -3156,7 +3261,7 @@ void InLobbyMenu::_inputBoxUpdate(bool blockChatInput)
 		playSound(0x27);
 		this->_chatOffset += SCROLL_AMOUNT;
 		this->_chatScrolledAwayFromBottom.store(true, std::memory_order_relaxed);
-		this->_chatTimer = max(this->_chatTimer, 180);
+			this->_chatTimer = max(this->_chatTimer.load(), 180);
 	}
 	if (this->keysPressed[VK_NEXT]) {
 		if (this->_chatOffset < SCROLL_AMOUNT)
@@ -3164,7 +3269,7 @@ void InLobbyMenu::_inputBoxUpdate(bool blockChatInput)
 		else
 			this->_chatOffset -= SCROLL_AMOUNT;
 		this->_chatScrolledAwayFromBottom.store(this->_chatOffset != 0, std::memory_order_relaxed);
-		this->_chatTimer = max(this->_chatTimer, 180);
+		this->_chatTimer = max(this->_chatTimer.load(), 180);
 		playSound(0x27);
 	}
 	if (!this->_editingText) {
@@ -3222,7 +3327,7 @@ void InLobbyMenu::_inputBoxUpdate(bool blockChatInput)
 		playSound(0x27);
 		this->_chatOffset += SCROLL_AMOUNT;
 		this->_chatScrolledAwayFromBottom.store(true, std::memory_order_relaxed);
-		this->_chatTimer = max(this->_chatTimer, 180);
+		this->_chatTimer = max(this->_chatTimer.load(), 180);
 		goto ret_reset_keysPressed;
 	}
 	if (this->keysPressed[VK_DOWN]) {
@@ -3231,7 +3336,7 @@ void InLobbyMenu::_inputBoxUpdate(bool blockChatInput)
 		else
 			this->_chatOffset -= SCROLL_AMOUNT;
 		this->_chatScrolledAwayFromBottom.store(this->_chatOffset != 0, std::memory_order_relaxed);
-		this->_chatTimer = max(this->_chatTimer, 180);
+		this->_chatTimer = max(this->_chatTimer.load(), 180);
 		playSound(0x27);
 		goto ret_reset_keysPressed;
 	}
@@ -3256,7 +3361,7 @@ void InLobbyMenu::_inputBoxUpdate(bool blockChatInput)
 		}
 		goto ret_reset_keysPressed;
 	}
-	this->_textMutex.lock();
+	textLock.lock();
 	if (this->immComposition.empty()) {
 		if (this->keysPressed[VK_HOME]) {
 			playSound(0x27);
@@ -3356,7 +3461,7 @@ void InLobbyMenu::_inputBoxUpdate(bool blockChatInput)
 		this->_refreshPrivateMessageCompletions();
 		this->_updateCompositionSprite();
 	}
-	this->_textMutex.unlock();
+	textLock.unlock();
 	ret_reset_keysPressed:
 	memset(this->keysPressed, 0, sizeof(this->keysPressed));
 }
@@ -4412,6 +4517,7 @@ void InLobbyMenu::_renderBattleChatHint()
 
 void InLobbyMenu::renderChat()
 {
+	ClientPerformance::Scope performance(ClientPerformance::Stage::ChatRender);
 	if (this->_disconnected)
 		return;
 	// Battle/select scene hooks render chat without calling onRender().
@@ -4472,8 +4578,13 @@ void InLobbyMenu::renderChat()
 					//txt.sprite.texture.createFromText(line.c_str(), this->_chatFont, {350, 300}, &txt.realSize);
 					// Each fragment is a single line. The old 300px surface paid for
 					// ten times the pixels on every upload and shadow pass.
-					if (!createTextTexture(texId, convertEncoding<char, wchar_t, UTF8Decode, UTF16Encode>(line).c_str(), this->_chatFont, {350, 32}, &txt.realSize))
+					if (!createTextTexture(texId, convertEncoding<char, wchar_t, UTF8Decode, UTF16Encode>(line).c_str(), this->_chatFont, {350, 32}, &txt.realSize)) {
 						puts("Error creating text texture");
+						m->text.pop_back();
+						startPos = pos;
+						line.clear();
+						return;
+					}
 					txt.sprite.texture.setHandle(texId, {350, 32});
 					txt.sprite.rect.width = txt.realSize.x;
 					txt.sprite.rect.height = txt.realSize.y;
@@ -5012,7 +5123,7 @@ void InLobbyMenu::_refreshPrivateMessageCompletions()
 		for (const auto &blockedName : Blocklist::list()) {
 			std::wstring name;
 			try {
-				name = convertEncoding<char, wchar_t, UTF8Decode, UTF16Encode>(blockedName);
+				name = convertEncoding<char, wchar_t, UTF8Decode, UTF16Encode>(ClientNames::displayName(blockedName));
 			} catch (...) {
 				continue;
 			}
@@ -5032,7 +5143,7 @@ void InLobbyMenu::_refreshPrivateMessageCompletions()
 		auto me = this->_connection->getMe();
 		if (recentOpponent && recentOpponent->playerId && !recentOpponent->playerName.empty()) {
 			try {
-				auto name = convertEncoding<char, wchar_t, UTF8Decode, UTF16Encode>(recentOpponent->playerName);
+				auto name = convertEncoding<char, wchar_t, UTF8Decode, UTF16Encode>(ClientNames::displayName(recentOpponent->playerName));
 				auto lowered = name;
 				std::transform(lowered.begin(), lowered.end(), lowered.begin(), towlower);
 				auto idText = std::to_wstring(recentOpponent->playerId);
@@ -5063,7 +5174,7 @@ void InLobbyMenu::_refreshPrivateMessageCompletions()
 				continue;
 			std::wstring name;
 			try {
-				name = convertEncoding<char, wchar_t, UTF8Decode, UTF16Encode>(player->name);
+				name = convertEncoding<char, wchar_t, UTF8Decode, UTF16Encode>(ClientNames::displayName(player->name));
 			} catch (...) {
 				continue;
 			}
@@ -5497,7 +5608,7 @@ void InLobbyMenu::_startHosting()
 
 void InLobbyMenu::addString(wchar_t *str, size_t size)
 {
-	this->_textMutex.lock();
+	std::unique_lock<std::mutex> textLock(this->_textMutex);
 	const size_t contentSize = this->_buffer.empty() ? 0 : this->_buffer.size() - 1;
 	const size_t available = contentSize < CHAT_CHARACTER_LIMIT - 1 ? CHAT_CHARACTER_LIMIT - 1 - contentSize : 0;
 
@@ -5506,14 +5617,14 @@ void InLobbyMenu::addString(wchar_t *str, size_t size)
 		size--;
 	if (!size) {
 		playSound(0x29);
-		this->_textMutex.unlock();
+		textLock.unlock();
 		return;
 	}
 	this->_buffer.insert(this->_buffer.begin() + this->_textCursorPosIndex, str, str + size);
 	this->_updateTextCursor(this->_textCursorPosIndex + size);
 	this->textChanged |= 1;
 	playSound(0x27);
-	this->_textMutex.unlock();
+	textLock.unlock();
 }
 
 void InLobbyMenu::_updateCompositionSprite()

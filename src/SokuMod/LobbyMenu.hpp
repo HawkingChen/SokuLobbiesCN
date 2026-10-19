@@ -26,7 +26,7 @@ private:
 		std::pair<unsigned, unsigned> lastPlayerCount = {0, 0};
 		SokuLib::DrawUtils::Sprite name;
 		SokuLib::DrawUtils::Sprite playerCount;
-		bool first = true;
+		std::atomic_bool first{true};
 		bool passwd = false;
 		std::string redirectIpForLocalServer;
 
@@ -83,6 +83,9 @@ private:
 	void _queueUi(std::function<void()> work, const void *refreshKey = nullptr);
 
 	void _netLoop();
+	void _stopWorkers();
+	void _runWorker(void (LobbyMenu::*work)(), const char *label) noexcept;
+	void _ipv6Loop();
 	void _masterServerLoop();
 	void _connectLoop();
 	void _updateTopAvatarOffset();

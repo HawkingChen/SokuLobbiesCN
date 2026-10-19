@@ -7,7 +7,8 @@
 #include <atomic>
 #include <string>
 
-const char *getMyIp(const std::atomic_bool *cancel = nullptr);
+// Returns an owned snapshot. Call only from a worker: a cache miss performs I/O.
+std::string getMyIp(const std::atomic_bool *cancel = nullptr);
 std::string getMyIpv6();
 bool isIpv6Available();
 void setMyIpv6(std::string &ipv6);

@@ -108,8 +108,10 @@ void LobbyMenu::_refreshName() {
 LobbyMenu::LobbyMenu(SokuLib::MenuConnect *parent) :
 	_parent(parent)
 {
-	if (hasIpv6Map())
-		this->_getIpv6Thread = std::thread(getIpv6Loop, std::ref(this->_open));
+	ClientConstructionGuard rollback([this]() noexcept {
+		_stopWorkers();
+		runClientCleanup("input assets unload", [] { inputBoxUnloadAssets(); });
+	});
 
 	if (!lobbyData)
 		lobbyData = std::make_unique<LobbyData>();
@@ -199,13 +201,19 @@ LobbyMenu::LobbyMenu(SokuLib::MenuConnect *parent) :
 	this->_unlock.rect.height = this->_unlock.texture.getSize().y;
 
 	_connectionSettings = _loadedSettings;
-	this->_netThread = std::thread(&LobbyMenu::_netLoop, this);
-	this->_connectThread = std::thread(&LobbyMenu::_connectLoop, this);
-	this->_masterThread = std::thread(&LobbyMenu::_masterServerLoop, this);
+	if (hasIpv6Map())
+		this->_getIpv6Thread = std::thread(&LobbyMenu::_runWorker, this, &LobbyMenu::_ipv6Loop, "IPv6 lookup");
+	this->_netThread = std::thread(&LobbyMenu::_runWorker, this, &LobbyMenu::_netLoop, "lobby ping");
+	this->_connectThread = std::thread(&LobbyMenu::_runWorker, this, &LobbyMenu::_connectLoop, "lobby connections");
+	this->_masterThread = std::thread(&LobbyMenu::_runWorker, this, &LobbyMenu::_masterServerLoop, "master server");
+	rollback.dismiss();
 }
 
 LobbyMenu::~LobbyMenu()
 {
+	// Stop even if saving settings or formatting an error message throws.
+	ClientConstructionGuard cleanup([this]() noexcept { _stopWorkers(); });
+	try {
 	auto path = std::filesystem::path(profileFolderPath) / "settings.dat";
 	std::ofstream s{path, std::ofstream::binary};
 	char version = 0;
@@ -217,26 +225,41 @@ LobbyMenu::~LobbyMenu()
 		s.close();
 	} else {
 		auto err = strerror(errno);
-		auto str = new wchar_t[strlen(err)];
-
-		for (int i = 0; err[i]; i++)
-			str[i] = err[i];
+		const std::wstring str(err, err + strlen(err));
 		MessageBoxW(SokuLib::window, (L"Cannot open " + path.wstring() + L" for writing: " + str).c_str(), L"Saving error", MB_ICONERROR);
-		delete[] str;
 	}
-	inputBoxUnloadAssets();
+	} catch (...) { fprintf(stderr, "Cannot save lobby settings\n"); }
+	runClientCleanup("input assets unload", [] { inputBoxUnloadAssets(); });
+	_stopWorkers();
+	cleanup.dismiss();
+	std::lock_guard<std::mutex> connectionsMutexGuard(this->_connectionsMutex);
+	this->_connections.clear();
+}
+
+void LobbyMenu::_stopWorkers()
+{
 	this->_open = false;
+	this->_mainServer.disconnect();
 	if (this->_netThread.joinable())
 		this->_netThread.join();
-	this->_mainServer.disconnect();
 	if (this->_masterThread.joinable())
 		this->_masterThread.join();
 	if (this->_connectThread.joinable())
 		this->_connectThread.join();
 	if (this->_getIpv6Thread.joinable())
 		this->_getIpv6Thread.join();
-	std::lock_guard<std::mutex> connectionsMutexGuard(this->_connectionsMutex);
-	this->_connections.clear();
+}
+
+void LobbyMenu::_ipv6Loop() { getIpv6Loop(_open); }
+
+void LobbyMenu::_runWorker(void (LobbyMenu::*work)(), const char *label) noexcept
+{
+	runClientWorker([&] { (this->*work)(); }, [label](const char *reason) {
+		fprintf(stderr, "Lobby %s worker failed: %s\n", label, reason);
+	}, [this]() noexcept {
+		_open = false;
+		_mainServer.disconnect();
+	});
 }
 
 void LobbyMenu::_netLoop()
@@ -244,11 +267,12 @@ void LobbyMenu::_netLoop()
 	while (this->_open) {
 		Lobbies::PacketPing ping;
 
-		this->_connectionsMutex.lock();
+		{
+		std::lock_guard<std::mutex> lock(this->_connectionsMutex);
 		for (auto &c : this->_connections)
 			if (c->c && c->c->hasConnected() && !c->c->isInit() && c->c->isConnected())
 				c->c->send(&ping, sizeof(ping));
-		this->_connectionsMutex.unlock();
+		}
 		for (int i = 0; i < 20 && this->_open; i++)
 			std::this_thread::sleep_for(std::chrono::milliseconds(100));
 	}
@@ -302,9 +326,11 @@ void LobbyMenu::_queueUi(std::function<void()> work, const void *refreshKey)
 
 int LobbyMenu::onProcess()
 {
+	if (!_open) return false;
 	try {
 		{ std::lock_guard<std::mutex> lock(_settingsMutex); _connectionSettings = _loadedSettings; }
 		execUiCallbacks();
+		if (!_open) return false;
 		inputBoxUpdate();
 		if (inputBoxShown)
 			return true;
@@ -421,7 +447,7 @@ bool LobbyMenu::_joinLobbyUpdate()
 		this->_menuState = 0;
 		return true;
 	}
-	this->_connectionsMutex.lock();
+	std::unique_lock<std::mutex> connectionsLock(this->_connectionsMutex);
 	if (std::abs(SokuLib::inputMgrs.input.verticalAxis) == 1 || (std::abs(SokuLib::inputMgrs.input.verticalAxis) > 36 && std::abs(SokuLib::inputMgrs.input.verticalAxis) % 6 == 0)) {
 		if (SokuLib::inputMgrs.input.verticalAxis < 0) {
 			this->_lobbyCtr += this->_connections.size();
@@ -436,6 +462,7 @@ bool LobbyMenu::_joinLobbyUpdate()
 		if (this->_lobbyCtr < this->_connections.size() && this->_connections[this->_lobbyCtr]->c && this->_connections[this->_lobbyCtr]->c->isConnected()) {
 			auto c = this->_connections[this->_lobbyCtr];
 			auto selected = c->c;
+			connectionsLock.unlock(); // Do not construct a menu while holding the list lock.
 
 			if (c->passwd) {
 				setWideInputBoxCallbacks([this, selected](const std::wstring &value){
@@ -450,15 +477,14 @@ bool LobbyMenu::_joinLobbyUpdate()
 				});
 				openWideInputDialog(chineseLanguage ? L"\u8F93\u5165\u5927\u5385\u5BC6\u7801" : L"Enter password", L"", 255, L'*');
 			} else {
-				this->_connections[this->_lobbyCtr]->c->setInitialPlayer(_loadedSettings);
-				SokuLib::activateMenu(new InLobbyMenu(this, this->_parent, this->_connections[this->_lobbyCtr]->c));
+				selected->setInitialPlayer(_loadedSettings);
+				SokuLib::activateMenu(new InLobbyMenu(this, this->_parent, selected));
 				this->_active = false;
 				playSound(0x28);
 			}
 		} else
 			playSound(0x29);
 	}
-	this->_connectionsMutex.unlock();
 	return true;
 }
 
@@ -581,7 +607,8 @@ int LobbyMenu::onRender()
 		else
 			displaySokuCursor({50, static_cast<int>(126 + this->_menuCursor * 24)}, {180, 16});
 		this->_ui.draw();
-		this->_connectionsMutex.lock();
+		{
+		std::lock_guard<std::mutex> lock(this->_connectionsMutex);
 		if (this->_menuState == 1)
 			displaySokuCursor({312, static_cast<int>(120 + this->_lobbyCtr * 16)}, {220, 16});
 		for (int i = 0; i < this->_connections.size(); i++) {
@@ -596,7 +623,7 @@ int LobbyMenu::onRender()
 				(connection.passwd ? this->_lock : this->_unlock).draw();
 			}
 		}
-		this->_connectionsMutex.unlock();
+		}
 		(this->*_renderCallbacks[this->_menuState])();
 		inputBoxRender();
 		this->_version.draw();
@@ -816,8 +843,7 @@ void LobbyMenu::_masterServerLoop()
 						);
 						setLobbyText(this->_loadingHint, chineseLanguage ? L"\u6309 S \u5207\u6362\u5230\u666E\u901A\u6A21\u5F0F" : L"Press S to switch to normal mode", 14, {600, 32});
 				};
-				runOnUI(fct);
-				this->_lastError.clear();
+				runOnUI(([this, fct] { _lastError.clear(); fct(); }));
 				this->_mainServer.connect(servHost, servPort);
 				puts("Connected!");
 			} catch (std::exception &e) {
@@ -832,11 +858,13 @@ void LobbyMenu::_masterServerLoop()
 					this->_loadingHint.texture.destroy();
 					this->_loadingHint.setSize({0, 0});
 				};
-				runOnUI(fct);
-				this->_lastError = e.what();
-				playSound(0x28);
-				activated = !activated;
-				this->_open = false;
+				runOnUI(([this, fct, reason = std::string(e.what())] {
+					_lastError = reason;
+					activated = !activated;
+					_open = false;
+					playSound(0x28);
+					fct();
+				}));
 				
 				goto fail;
 				
@@ -906,8 +934,7 @@ void LobbyMenu::_masterServerLoop()
 				this->_loadingHint.texture.destroy();
 				this->_loadingHint.setSize({0, 0});
 			};
-			runOnUI(fct);
-			this->_lastError = e.what();
+			runOnUI(([this, fct, reason = std::string(e.what())] { _lastError = reason; fct(); }));
 		}
 	fail:
 		for (int i = 0; i < 100 && this->_open; i++)
@@ -921,16 +948,14 @@ void LobbyMenu::_connectLoop()
 
 	while (this->_open) {
 		for (int j = 0; this->_open; j++) {
-			this->_connectionsMutex.lock();
-			if (j >= this->_connections.size()) {
-				this->_connectionsMutex.unlock();
-				break;
+			std::shared_ptr<Entry> connection;
+			std::shared_ptr<Connection> transport;
+			{
+				std::lock_guard<std::mutex> lock(this->_connectionsMutex);
+				if (j >= this->_connections.size()) break;
+				connection = this->_connections[j];
+				transport = connection->c;
 			}
-
-			auto connection = this->_connections[j];
-			auto transport = connection->c;
-
-			this->_connectionsMutex.unlock();
 
 			auto weak = std::weak_ptr(connection);
 
@@ -1016,9 +1041,11 @@ void LobbyMenu::_connectLoop()
 						SokuLib::Vector2i size;
 						int texId = 0;
 
-						connection->lastName = info.name;
-						if (!createTextTexture(texId, convertEncoding<char, wchar_t, UTF8Decode, UTF16Encode>(info.name).c_str(), lobbyData->getFont(16), {300, 74}, &size))
+						if (!createTextTexture(texId, convertEncoding<char, wchar_t, UTF8Decode, UTF16Encode>(info.name).c_str(), lobbyData->getFont(16), {300, 74}, &size)) {
 							puts("Error creating text texture");
+							return; // Retain the old texture and retry on the next refresh.
+						}
+						connection->lastName = info.name;
 						connection->name.texture.setHandle(texId, {300, 74});
 						connection->name.setSize({
 							connection->name.texture.getSize().x,

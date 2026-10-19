@@ -6,8 +6,10 @@
 #include <imm.h>
 #include <mutex>
 #include <process.h>
+#include <algorithm>
 #include "InputBox.hpp"
 #include "createUTFTexture.hpp"
+#include "ClientTransport.hpp"
 
 #define CURSOR_ENDX 465
 #define CURSOR_STARTX 174
@@ -256,7 +258,7 @@ void inputBoxUpdate()
 		escPressed = true;
 		return;
 	}
-	mutex.lock();
+	std::unique_lock<std::mutex> inputLock(mutex);
 	if (wideMode) {
 		if (timers[VK_HOME] == 1) {
 			wideCursorPos = 0;
@@ -270,7 +272,7 @@ void inputBoxUpdate()
 		}
 		if (timers[VK_RETURN] == 1) {
 			returnPressed = true;
-			mutex.unlock();
+			inputLock.unlock();
 			return;
 		}
 		if (timers[VK_BACK] == 1 || (timers[VK_BACK] > 36 && timers[VK_BACK] % 6 == 0)) {
@@ -306,7 +308,7 @@ void inputBoxUpdate()
 				playSound(0x27);
 			}
 		}
-		mutex.unlock();
+		inputLock.unlock();
 		return;
 	}
 	if (timers[VK_HOME] == 1) {
@@ -319,7 +321,7 @@ void inputBoxUpdate()
 	}
 	if (timers[VK_RETURN] == 1) {
 		returnPressed = true;
-		mutex.unlock();
+		inputLock.unlock();
 		return;
 	}
 	if (timers[VK_BACK] == 1 || (timers[VK_BACK] > 36 && timers[VK_BACK] % 6 == 0)) {
@@ -370,35 +372,36 @@ void inputBoxUpdate()
 			SokuLib::newSceneId == SokuLib::SCENE_BATTLESV
 		)
 	) {
-		mutex.unlock();
+		inputLock.unlock();
 		return;
 	}
 	if (changes)
 		textSprite.texture.createFromText(sanitizeInput().c_str(), defaultFont12, {max(292, 8 * buffer.size()), 1800});
 	changes = false;
-	mutex.unlock();
+	inputLock.unlock();
 }
 
-LRESULT __stdcall Hooked_WndProc(const HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
+static std::optional<LRESULT> handleInputBoxWindowMessage(const HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
 {
 	if (inputBoxShown && wideMode) {
 		if (uMsg == WM_KEYDOWN &&
 			((wParam == 'V' && (GetKeyState(VK_CONTROL) & 0x8000)) || (wParam == VK_INSERT && (GetKeyState(VK_SHIFT) & 0x8000)))) {
 			if (OpenClipboard(hWnd)) {
+				ClientConstructionGuard closeClipboard([]() noexcept { CloseClipboard(); });
 				HANDLE handle = GetClipboardData(CF_UNICODETEXT);
 				if (handle) {
 					const auto *clipboard = static_cast<const wchar_t *>(GlobalLock(handle));
 					if (clipboard) {
-						std::wstring pasted(clipboard);
+						ClientConstructionGuard unlockClipboard([handle]() noexcept { GlobalUnlock(handle); });
+						const auto limit = (std::min)(static_cast<size_t>(GlobalSize(handle) / sizeof(wchar_t)), wideMaxLength);
+						std::wstring pasted(clipboard, std::find(clipboard, clipboard + limit, L'\0'));
 						for (auto &chr : pasted)
 							if (chr == L'\r' || chr == L'\n')
 								chr = L' ';
 						std::lock_guard<std::mutex> lock(mutex);
 						insertWideText(pasted);
-						GlobalUnlock(handle);
 					}
 				}
-				CloseClipboard();
 			}
 			return 0;
 		}
@@ -426,10 +429,11 @@ LRESULT __stdcall Hooked_WndProc(const HWND hWnd, UINT uMsg, WPARAM wParam, LPAR
 		if (uMsg == WM_IME_COMPOSITION) {
 			HIMC context = ImmGetContext(hWnd);
 			if (context) {
+				ClientConstructionGuard releaseContext([&]() noexcept { ImmReleaseContext(hWnd, context); });
 				std::lock_guard<std::mutex> lock(mutex);
 				if (lParam & GCS_RESULTSTR) {
 					LONG bytes = ImmGetCompositionStringW(context, GCS_RESULTSTR, nullptr, 0);
-					if (bytes > 0) {
+					if (bytes > 0 && bytes <= 65536 && bytes % sizeof(wchar_t) == 0) {
 						std::wstring result(static_cast<size_t>(bytes) / sizeof(wchar_t), L'\0');
 						if (ImmGetCompositionStringW(context, GCS_RESULTSTR, result.data(), bytes) == bytes)
 							insertWideText(result);
@@ -439,13 +443,14 @@ LRESULT __stdcall Hooked_WndProc(const HWND hWnd, UINT uMsg, WPARAM wParam, LPAR
 				if (lParam & GCS_COMPSTR) {
 					LONG bytes = ImmGetCompositionStringW(context, GCS_COMPSTR, nullptr, 0);
 					wideComposition.clear();
-					if (bytes > 0) {
+					if (bytes > 0 && bytes <= 65536 && bytes % sizeof(wchar_t) == 0) {
 						wideComposition.resize(static_cast<size_t>(bytes) / sizeof(wchar_t));
-						ImmGetCompositionStringW(context, GCS_COMPSTR, wideComposition.data(), bytes);
+						const auto copied = ImmGetCompositionStringW(context, GCS_COMPSTR, wideComposition.data(), bytes);
+						if (copied < 0 || copied > bytes || copied % sizeof(wchar_t) != 0) wideComposition.clear();
+						else wideComposition.resize(copied / sizeof(wchar_t));
 					}
 				}
 				wideDirty = true;
-				ImmReleaseContext(hWnd, context);
 			}
 			return 0;
 		}
@@ -463,7 +468,7 @@ LRESULT __stdcall Hooked_WndProc(const HWND hWnd, UINT uMsg, WPARAM wParam, LPAR
 			int nb = ToAscii((UINT)wParam, lParam, keyboardState, &chr, 0);
 
 			if (nb == 1 && chr < 0x7F && chr >= 32) {
-				mutex.lock();
+				std::unique_lock<std::mutex> inputLock(mutex);
 				if (lastPressed && t == 0) {
 					buffer.insert(buffer.begin() + cursorPos, lastPressed);
 					updateCursor(cursorPos + 1);
@@ -472,11 +477,11 @@ LRESULT __stdcall Hooked_WndProc(const HWND hWnd, UINT uMsg, WPARAM wParam, LPAR
 				}
 				lastPressed = chr;
 				t = 0;
-				mutex.unlock();
+				inputLock.unlock();
 			}
 		}
 	} else if (uMsg == WM_KEYUP && inputBoxShown) {
-		mutex.lock();
+		std::unique_lock<std::mutex> inputLock(mutex);
 		if (lastPressed && t == 0) {
 			buffer.insert(buffer.begin() + cursorPos, lastPressed);
 			updateCursor(cursorPos + 1);
@@ -484,9 +489,17 @@ LRESULT __stdcall Hooked_WndProc(const HWND hWnd, UINT uMsg, WPARAM wParam, LPAR
 		}
 		lastPressed = 0;
 		t = 0;
-		mutex.unlock();
+		inputLock.unlock();
 	}
-	return CallWindowProc(Original_WndProc, hWnd, uMsg, wParam, lParam);
+	return std::nullopt;
+}
+
+LRESULT __stdcall Hooked_WndProc(const HWND hWnd, UINT uMsg, WPARAM wParam, LPARAM lParam)
+{
+	auto result = runClientWindowCallback("input dialog", [&] { return handleInputBoxWindowMessage(hWnd, uMsg, wParam, lParam); });
+	if (result) return *result;
+	return Original_WndProc ? CallWindowProc(Original_WndProc, hWnd, uMsg, wParam, lParam)
+		: DefWindowProc(hWnd, uMsg, wParam, lParam);
 }
 
 void inputBoxLoadAssets()

@@ -24,8 +24,7 @@
 class LobbyData {
 private:
 	struct MemoryStruct {
-		char *memory;
-		size_t size;
+		std::string body;
 	};
 
 	void _loadStats();
@@ -45,7 +44,7 @@ private:
 	void _grantCrashAchievements();
 	void _grantDebugAchievements();
 
-	static size_t LobbyData::writeMemoryCallback(void *contents, size_t size, size_t nmemb, void *userp);
+	static size_t LobbyData::writeMemoryCallback(void *contents, size_t size, size_t nmemb, void *userp) noexcept;
 
 	std::map<unsigned, SokuLib::SWRFont> _fonts;
 	std::unique_ptr<RelativeRatings> _relativeRatings;

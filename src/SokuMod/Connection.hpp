@@ -19,6 +19,7 @@
 #include "ClientTransport.hpp"
 #include <memory>
 #include <condition_variable>
+#include <future>
 
 #define PLAYER_H_SPEED 4
 #define PLAYER_V_SPEED 4
@@ -63,6 +64,12 @@ private:
 	unsigned short _port;
 	std::atomic_bool _hasConnected{false};
 	std::atomic_bool _connected{true};
+	std::atomic_bool _ipLookupAlive{true};
+	std::future<std::pair<std::string, std::string>> _ipLookup;
+	std::atomic_bool _gameInfoPending{false};
+	uint64_t _gameInfoSession = 0;
+	uint8_t _gameInfoMachine = 0;
+	unsigned short _gameInfoPort = 0;
 	std::atomic_bool _init{false};
 	std::atomic_bool _spectatingArcade{false};
 	std::atomic_bool _spectatingScene{false};
@@ -81,11 +88,15 @@ private:
 	static std::vector<std::function<void (Player &, const LobbyData::Avatar &)>> _playerUpdateHandles;
 
 	void _netLoop();
+	void _connectLoop();
+	void _runWorker(void (Connection::*work)(), const char *label) noexcept;
 	void _sendLoop();
 	void _failTransport(const std::string &reason);
+	void _stopTransport();
 	void _publishHeartbeat();
 	void _queueHeartbeat();
 	void _pumpEvents(std::chrono::steady_clock::time_point deadline);
+	void _finishGameInfo();
 	bool _handlePacket(const Lobbies::Packet &packet, size_t &size);
 	bool _handlePacket(const Lobbies::PacketHello &packet, size_t &size);
 	bool _handlePacket(const Lobbies::PacketOlleh &packet, size_t &size);

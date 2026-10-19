@@ -21,6 +21,8 @@
 #include "integration.hpp"
 #include "Connection.hpp"
 #include "dinput.h"
+#include "ClientPerformance.hpp"
+#include "ClientRenderDiagnostics.hpp"
 
 typedef HRESULT(__stdcall* EndSceneFn)(IDirect3DDevice9*);
 
@@ -854,6 +856,9 @@ void loadSoku2CSV(LPWSTR path)
 
 void onUpdate()
 {
+	ClientRenderDiagnostics::sample(SokuLib::pd3dDev, SokuLib::sceneId);
+	ClientPerformance::tick(profileFolderPath, SokuLib::sceneId, activeMenu != nullptr, modVersion);
+	ClientPerformance::Scope performance(ClientPerformance::Stage::UpdateHook);
 	Connection::pumpNetworkEvents();
 #ifdef _DEBUG
 	if (SokuLib::checkKeyOneshot(DIK_F4, false, false, false) && !activeMenu) {
@@ -868,8 +873,10 @@ void onUpdate()
 #endif
 	if (SokuLib::sceneId != SokuLib::SCENE_LOGO && lobbyData)
 		lobbyData->update();
-	if (og_onUpdate)
+	if (og_onUpdate) {
+		ClientPerformance::Scope original(ClientPerformance::Stage::OriginalUpdate);
 		og_onUpdate();
+	}
 }
 
 void loadSoku2Config()
@@ -978,6 +985,14 @@ static void __fastcall KeymapManagerSetInputs(SokuLib::KeymapManager *This)
 
 int __stdcall Hooked_EndScene(IDirect3DDevice9* pDevice)
 {
+#ifdef SOKU_CLIENT_PERFORMANCE
+	static auto previous = std::chrono::steady_clock::now();
+	auto now = std::chrono::steady_clock::now();
+	ClientPerformance::record(ClientPerformance::Stage::RenderGap,
+		std::chrono::duration_cast<std::chrono::microseconds>(now - previous).count());
+	previous = now;
+#endif
+	ClientPerformance::Scope performance(ClientPerformance::Stage::EndScene);
 	if (SokuLib::sceneId != SokuLib::SCENE_LOGO && lobbyData)
 		lobbyData->render();
 

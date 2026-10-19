@@ -1,5 +1,9 @@
 #include "RelativeRatings.hpp"
 #include "RatingsNetworkDiagnostics.hpp"
+#include "ClientTransport.hpp"
+#include "HttpResponseBuffer.hpp"
+#include "Utf8Name.hpp"
+#include "ClientPerformance.hpp"
 
 #include <Windows.h>
 #include <curl/curl.h>
@@ -12,11 +16,16 @@
 #include <fstream>
 #include <iomanip>
 #include <limits>
+#include <memory>
 #include <sstream>
 #include <unordered_set>
 
 namespace {
 	using Json = nlohmann::json;
+	bool caBundleExists(const std::wstring &path) {
+		std::error_code error;
+		return std::filesystem::exists(path, error);
+	}
 	constexpr std::size_t maxResponseSize = 12u * 1024u * 1024u;
 	std::uint64_t fileTimeNow()
 	{
@@ -40,16 +49,10 @@ namespace {
 		std::atomic_bool *stopping = nullptr;
 	};
 
-	size_t receiveBody(char *data, size_t size, size_t count, void *context)
+	size_t receiveBody(char *data, size_t size, size_t count, void *context) noexcept
 	{
 		auto *buffer = static_cast<DownloadBuffer *>(context);
-		if (size && count > maxResponseSize / size)
-			return 0;
-		size_t bytes = size * count;
-		if (bytes > maxResponseSize - buffer->body.size())
-			return 0;
-		buffer->body.append(data, bytes);
-		return bytes;
+		return buffer ? appendHttpResponse(buffer->body, data, size, count, maxResponseSize) : 0;
 	}
 
 	int transferProgress(void *context, curl_off_t, curl_off_t, curl_off_t, curl_off_t)
@@ -114,11 +117,16 @@ RelativeRatings::~RelativeRatings()
 
 void RelativeRatings::setEnabled(bool enabled)
 {
-	if (enabled && !_worker.joinable()) {
-		_stopping.store(false, std::memory_order_relaxed);
-		_worker = std::thread(&RelativeRatings::_run, this);
+	if (enabled && _workerFailed.load()) {
+		if (_worker.joinable()) _worker.join();
+		_workerFailed = false;
 	}
 	_enabled.store(enabled, std::memory_order_relaxed);
+	if (enabled && !_worker.joinable()) {
+		_stopping.store(false, std::memory_order_relaxed);
+		try { _worker = std::thread(&RelativeRatings::_runGuarded, this); }
+		catch (...) { _enabled = false; _workerFailed = true; }
+	}
 	_wake.notify_all();
 	_debugLog(std::string("ratings enabled=") + (enabled ? "true" : "false"));
 }
@@ -137,6 +145,7 @@ bool RelativeRatings::setMapping(const std::string &profile, const std::string &
 	const auto cleanProfile = trim(profile);
 	const auto cleanAccount = trim(account);
 	if (cleanProfile.empty() || cleanProfile.size() >= 129 || cleanAccount.size() >= 129 ||
+		!ClientNames::validRatingName(cleanProfile) || (!cleanAccount.empty() && !ClientNames::validRatingName(cleanAccount)) ||
 		cleanProfile.find_first_of("\t\r\n") != std::string::npos || cleanAccount.find_first_of("\t\r\n") != std::string::npos)
 		return false;
 	std::vector<std::string> lines;
@@ -181,9 +190,17 @@ bool RelativeRatings::setMapping(const std::string &profile, const std::string &
 
 bool RelativeRatings::lookup(const std::string &profile, Rating &rating) const
 {
+	ClientPerformance::Scope performance(ClientPerformance::Stage::RatingLookup);
 	const auto name = trim(profile);
-	if (name.empty())
+	if (!ClientNames::validRatingName(name)) {
+		if (!name.empty()) {
+			const auto now = GetTickCount64();
+			auto last = _lastInvalidNameLogAt.load();
+			if (now - last >= 10000 && _lastInvalidNameLogAt.compare_exchange_strong(last, now))
+				runClientTask([&] { _debugLog("ratings lookup skipped: invalid UTF-8 name bytes=" + std::to_string(name.size())); }, [](const char *) {});
+		}
 		return false;
+	}
 	std::lock_guard<std::mutex> lock(_mutex);
 	if (_enabled.load(std::memory_order_relaxed)) {
 		const auto now = fileTimeNow();
@@ -251,7 +268,7 @@ void RelativeRatings::_loadMappings()
 			continue;
 		auto profile = trim(line.substr(0, tab));
 		auto account = trim(line.substr(tab + 1));
-		if (!profile.empty() && !account.empty() && profile.size() < 129 && account.size() < 129)
+		if (ClientNames::validRatingName(profile) && ClientNames::validRatingName(account) && profile.size() < 129 && account.size() < 129)
 			mappings.emplace(std::move(profile), std::move(account));
 	}
 	std::lock_guard<std::mutex> lock(_mutex);
@@ -345,6 +362,7 @@ bool RelativeRatings::_publish(const std::string &text)
 
 void RelativeRatings::_downloadProfiles(const std::vector<std::string> &profiles)
 {
+	ClientPerformance::Scope performance(ClientPerformance::Stage::RatingBatch);
 	std::error_code fsError;
 	std::filesystem::create_directories(_cachePath, fsError);
 	const auto cacheFileFor = [&](const std::string &name) {
@@ -354,6 +372,7 @@ void RelativeRatings::_downloadProfiles(const std::vector<std::string> &profiles
 	};
 	std::vector<std::string> pending;
 	for (const auto &profile : profiles) {
+		if (!ClientNames::validRatingName(profile)) continue;
 		const auto path = cacheFileFor(profile);
 		const auto written = cacheTime(path);
 		if (written) {
@@ -381,16 +400,23 @@ void RelativeRatings::_downloadProfiles(const std::vector<std::string> &profiles
 
 	std::string lastFetchInfo;
 	auto fetch = [&](const std::string &url, const std::string *postBody, std::string &body, const std::string &label) {
-		CURL *curl = curl_easy_init();
-		if (!curl) {
+		DownloadBuffer response{{}, &_enabled, &_stopping};
+		curl_slist *headers = nullptr;
+		ClientConstructionGuard freeHeaders([&]() noexcept { curl_slist_free_all(headers); });
+		char errorBuffer[CURL_ERROR_SIZE]{};
+		const auto caPath = std::filesystem::path(_caPath).string();
+		// Destroy curl before the callback buffers and header list, including
+		// when formatting/logging a request result throws.
+		std::unique_ptr<CURL, decltype(&curl_easy_cleanup)> request(curl_easy_init(), &curl_easy_cleanup);
+		if (!request) {
 			lastFetchInfo = label + " curl init failed";
 			return false;
 		}
-		DownloadBuffer response{{}, &_enabled, &_stopping};
-		curl_slist *headers = nullptr;
-		if (postBody) headers = curl_slist_append(headers, "Content-Type: application/json");
-		char errorBuffer[CURL_ERROR_SIZE]{};
-		const auto caPath = std::filesystem::path(_caPath).string();
+		auto *curl = request.get();
+		if (postBody) {
+			headers = curl_slist_append(headers, "Content-Type: application/json");
+			if (!headers) throw std::bad_alloc();
+		}
 		curl_easy_setopt(curl, CURLOPT_URL, url.c_str());
 		curl_easy_setopt(curl, CURLOPT_ERRORBUFFER, errorBuffer);
 		curl_easy_setopt(curl, CURLOPT_PROTOCOLS, CURLPROTO_HTTPS);
@@ -449,8 +475,6 @@ void RelativeRatings::_downloadProfiles(const std::vector<std::string> &profiles
 #endif
 		if (result != CURLE_OK && errorBuffer[0])
 			lastFetchInfo += " detail=" + std::string(errorBuffer);
-		curl_easy_cleanup(curl);
-		curl_slist_free_all(headers);
 		_debugLog("request end: " + lastFetchInfo);
 #ifdef SOKU_RATINGS_NETWORK_PROBE
 		const bool transportFailure = result == CURLE_SSL_CONNECT_ERROR || result == CURLE_COULDNT_CONNECT ||
@@ -471,8 +495,10 @@ void RelativeRatings::_downloadProfiles(const std::vector<std::string> &profiles
 		return !body.empty();
 	};
 	auto queryBatch = [&](const std::vector<std::string> &names, std::string &body) {
+		const auto safeNames = ClientNames::ratingNames(names);
+		if (safeNames.empty()) { lastFetchInfo = "No valid UTF-8 rating names"; return false; }
 		Json request;
-		request["names"] = names;
+		request["names"] = safeNames;
 		const auto postBody = request.dump();
 		return fetch("https://soku.cleista.cc/api/v1/ratings/players", &postBody, body, "ratings/players POST");
 	};
@@ -480,7 +506,7 @@ void RelativeRatings::_downloadProfiles(const std::vector<std::string> &profiles
 	std::string body;
 	if (!queryBatch(pending, body)) {
 		_debugLog("batch request failed: " + lastFetchInfo + " ca_bundle_exists=" +
-			(std::filesystem::exists(_caPath) ? "true" : "false"));
+			(caBundleExists(_caPath) ? "true" : "false"));
 		std::lock_guard<std::mutex> lock(_mutex);
 		for (const auto &name : pending) _profileChecked[name] = fileTimeNow() - 5400000000ULL;
 		return;
@@ -508,17 +534,17 @@ void RelativeRatings::_downloadProfiles(const std::vector<std::string> &profiles
 	std::size_t aliasFailures = 0;
 	for (const auto &name : pending) {
 		if (foundNames.count(name)) continue;
-		CURL *curl = curl_easy_init();
-		if (!curl) continue;
+		std::unique_ptr<CURL, decltype(&curl_easy_cleanup)> request(curl_easy_init(), &curl_easy_cleanup);
+		if (!request) continue;
+		auto *curl = request.get();
 		char *encoded = curl_easy_escape(curl, name.c_str(), static_cast<int>(name.size()));
+		ClientConstructionGuard freeEncoded([&]() noexcept { curl_free(encoded); });
 		std::string mapping;
 		if (encoded) {
 			++aliasAttempts;
 			if (!fetch("https://soku.cleista.cc/api/names/profiles?name=" + std::string(encoded), nullptr, mapping, "names/profiles GET"))
 				++aliasFailures;
 		}
-		curl_free(encoded);
-		curl_easy_cleanup(curl);
 		try {
 			auto root = Json::parse(mapping);
 			auto item = root.find(name);
@@ -581,14 +607,33 @@ void RelativeRatings::_downloadProfiles(const std::vector<std::string> &profiles
 	} catch (...) {}
 }
 
+void RelativeRatings::_runGuarded() noexcept
+{
+	runClientWorker([this] { _run(); }, [this](const char *reason) {
+		_debugLog(std::string("rating worker stopped: ") + reason);
+	}, [this]() noexcept {
+		_enabled = false;
+		_stopping = true;
+		_workerFailed = true;
+		_wake.notify_all();
+	});
+}
+
 void RelativeRatings::_run()
 {
 	_loadMappings();
 #ifdef SOKU_RATINGS_NETWORK_PROBE
 	logRatingsNetworkEnvironment([this](const std::string &entry) { _debugLog(entry); });
 #endif
-	_debugLog(std::string("worker started ca_bundle_exists=") + (std::filesystem::exists(_caPath) ? "true" : "false"));
+	_debugLog(std::string("worker started ca_bundle_exists=") + (caBundleExists(_caPath) ? "true" : "false"));
 	while (!_stopping.load(std::memory_order_relaxed)) {
+#ifdef SOKU_CLIENT_PERFORMANCE
+		{
+			std::lock_guard<std::mutex> lock(_mutex);
+			ClientPerformance::gauge(ClientPerformance::Gauge::RatingPending, _pendingProfiles.size());
+			ClientPerformance::gauge(ClientPerformance::Gauge::RatingCache, _byQuery.size());
+		}
+#endif
 		if (!_enabled.load(std::memory_order_relaxed)) {
 			std::unique_lock<std::mutex> lock(_mutex);
 			_wake.wait(lock, [this] { return _stopping.load(std::memory_order_relaxed) || _enabled.load(std::memory_order_relaxed); });
@@ -606,7 +651,15 @@ void RelativeRatings::_run()
 			pendingProfiles.swap(_pendingProfiles);
 		}
 		if (!pendingProfiles.empty()) {
-			_downloadProfiles(pendingProfiles);
+			const bool completed = runClientTask([&] { _downloadProfiles(pendingProfiles); }, [this](const char *reason) {
+				_debugLog(std::string("rating batch failed; worker continues: ") + reason);
+			});
+			if (!completed) {
+				// Retain published data and the existing per-name query cooldown.
+				// Wait rather than spin if more incoming names keep causing errors.
+				std::unique_lock<std::mutex> lock(_mutex);
+				_wake.wait_for(lock, std::chrono::seconds(5), [this] { return _stopping.load() || !_enabled.load(); });
+			}
 			continue;
 		}
 		std::unique_lock<std::mutex> lock(_mutex);

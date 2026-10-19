@@ -3,6 +3,7 @@
 //
 
 #include "createUTFTexture.hpp"
+#include "ClientPerformance.hpp"
 
 #include <map>
 #include <string>
@@ -177,8 +178,23 @@ static bool isD3D9ExDevice()
 
 bool createTextTexture(int &retId, const wchar_t* text, SokuLib::SWRFont& font, SokuLib::Vector2i texsize, SokuLib::Vector2i *size, bool sharp, bool outline)
 {
+	ClientPerformance::Scope performance(ClientPerformance::Stage::TextTexture);
+	retId = 0;
+	if (size) *size = {0, 0};
+	struct ResultGuard {
+		int &id;
+		SokuLib::Vector2i *size;
+		bool succeeded = false;
+		~ResultGuard() {
+			ClientPerformance::texture(succeeded);
+			// Every failure path below releases its handle. Never publish it again.
+			if (!succeeded) { id = 0; if (size) *size = {0, 0}; }
+		}
+	} resultGuard{retId, size};
+	if (!text || !SokuLib::pd3dDev || texsize.x <= 0 || texsize.y <= 0) return false;
 	auto strSize = wcslen(text);
 	LPDIRECT3DTEXTURE9 *texPtr = SokuLib::textureMgr.allocate(&retId);
+	if (!texPtr) return false;
 	LPDIRECT3DTEXTURE9 texPtr2 = nullptr;
 	LPDIRECT3DTEXTURE9 uploadTexture = nullptr;
 	LPDIRECT3DTEXTURE9 outputTexture = nullptr;
@@ -189,7 +205,9 @@ bool createTextTexture(int &retId, const wchar_t* text, SokuLib::SWRFont& font, 
 	HDC context;
 	SIZE actualSize;
 	bool d3d9Ex = isD3D9ExDevice();
+	ClientPerformance::gauge(ClientPerformance::Gauge::TextD3D9Ex, d3d9Ex);
 	auto cpuPool = d3d9Ex ? D3DPOOL_SYSTEMMEM : D3DPOOL_MANAGED;
+	ClientPerformance::Scope phase(ClientPerformance::Stage::TextCreate);
 
 	*texPtr = nullptr;
 	EnterCriticalSection((LPCRITICAL_SECTION)0x8a0e14);
@@ -224,6 +242,7 @@ bool createTextTexture(int &retId, const wchar_t* text, SokuLib::SWRFont& font, 
 		return false;
 	}
 
+	phase.next(ClientPerformance::Stage::TextGetDC);
 	if (D3D_OK != texPtr2->GetSurfaceLevel(0, &surface)) {
 		puts("Error in GetSurfaceLevel");
 		texPtr2->Release();
@@ -243,6 +262,7 @@ bool createTextTexture(int &retId, const wchar_t* text, SokuLib::SWRFont& font, 
 		return false;
 	}
 
+	phase.next(ClientPerformance::Stage::TextGDI);
 	PatBlt(context, 0, 0, texsize.x, texsize.y, BLACKNESS);
 	font.maxWidth = texsize.x;
 	font.maxHeight = texsize.y;
@@ -281,6 +301,7 @@ bool createTextTexture(int &retId, const wchar_t* text, SokuLib::SWRFont& font, 
 	surface->ReleaseDC(context);
 	surface->Release();
 
+	phase.next(ClientPerformance::Stage::TextLock);
 	if (D3D_OK != outputTexture->LockRect(0, &r1, nullptr, 0)) {
 		puts("Error in LockRect 1");
 		texPtr2->Release();
@@ -299,6 +320,7 @@ bool createTextTexture(int &retId, const wchar_t* text, SokuLib::SWRFont& font, 
 		return false;
 	}
 
+	phase.next(ClientPerformance::Stage::TextPixels);
 	auto ptr1 = reinterpret_cast<SokuLib::DrawUtils::DxSokuColor *>(r1.pBits);
 	auto ptr2 = reinterpret_cast<SokuLib::DrawUtils::DxSokuColor *>(r2.pBits);
 	auto outputLineSize = r1.Pitch / sizeof(*ptr1);
@@ -337,6 +359,7 @@ bool createTextTexture(int &retId, const wchar_t* text, SokuLib::SWRFont& font, 
 		}
 	} else if (font.description.shadow)
 		repl_textShadow(texsize.y, texsize.x, inputLineSize, outputLineSize, reinterpret_cast<unsigned *>(r2.pBits), reinterpret_cast<unsigned *>(r1.pBits));
+	phase.next(ClientPerformance::Stage::TextUpload);
 	texPtr2->UnlockRect(0);
 	outputTexture->UnlockRect(0);
 	texPtr2->Release();
@@ -351,6 +374,7 @@ bool createTextTexture(int &retId, const wchar_t* text, SokuLib::SWRFont& font, 
 			return false;
 		}
 	}
+	resultGuard.succeeded = true;
 	return true;
 }
 

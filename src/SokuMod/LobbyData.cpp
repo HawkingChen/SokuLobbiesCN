@@ -9,6 +9,8 @@
 #include "data.hpp"
 #include "LobbyData.hpp"
 #include "dinput.h"
+#include "HttpResponseBuffer.hpp"
+#include "ClientTransport.hpp"
 
 #define ACH_GET_TOTAL_TIME 360
 #define ACH_GET_FADE_IN_ANIM 45
@@ -757,21 +759,9 @@ void LobbyData::_loadArcades()
 	}
 }
 
-size_t LobbyData::writeMemoryCallback(void *contents, size_t size, size_t nmemb, void *userp)
+size_t LobbyData::writeMemoryCallback(void *contents, size_t size, size_t nmemb, void *userp) noexcept
 {
-	size_t realsize = size * nmemb;
-	auto mem = (MemoryStruct *)userp;
-	auto ptr = (char *)realloc(mem->memory, mem->size + realsize + 1);
-
-	if (ptr == nullptr) {
-		free(mem->memory);
-		throw std::runtime_error("not enough memory (realloc returned NULL)");
-	}
-	mem->memory = ptr;
-	memcpy(&mem->memory[mem->size], contents, realsize);
-	mem->size += realsize;
-	mem->memory[mem->size] = 0;
-	return realsize;
+	return userp ? appendHttpResponse(static_cast<MemoryStruct *>(userp)->body, contents, size, nmemb) : 0;
 }
 
 LobbyData::LobbyData()
@@ -1079,18 +1069,24 @@ void LobbyData::_grantDebugAchievements()
 
 std::string LobbyData::httpRequest(const std::string &url, const std::string &method, const std::string &data, long timeoutMs, const std::atomic_bool *cancel, const std::string &bearerToken)
 {
-	std::string response;
-	int response_code;
-	CURL *request_handle;
+	if (cancel && !cancel->load()) throw std::runtime_error("HTTP request cancelled");
+	long response_code = 0;
 	MemoryStruct request_chunk;
 	curl_slist *headers = nullptr;
-
-	request_handle = curl_easy_init();
+	std::unique_ptr<CURL, decltype(&curl_easy_cleanup)> handle(curl_easy_init(), &curl_easy_cleanup);
+	if (!handle) throw std::runtime_error("Cannot initialize HTTP request");
+	auto *request_handle = handle.get();
+	ClientConstructionGuard freeHeaders([&]() noexcept { curl_slist_free_all(headers); });
+	auto appendHeader = [&](const char *value) {
+		auto *next = curl_slist_append(headers, value);
+		if (!next) throw std::bad_alloc();
+		headers = next;
+	};
 	if (method != "GET") {
 		curl_easy_setopt(request_handle, CURLOPT_CUSTOMREQUEST, method.c_str());
-		headers = curl_slist_append(headers, "Content-Type: application/json");
+		appendHeader("Content-Type: application/json");
 		if (!bearerToken.empty())
-			headers = curl_slist_append(headers, ("Authorization: Bearer " + bearerToken).c_str());
+			appendHeader(("Authorization: Bearer " + bearerToken).c_str());
 		curl_easy_setopt(request_handle, CURLOPT_HTTPHEADER, headers);
 	}
 	curl_easy_setopt(request_handle, CURLOPT_WRITEFUNCTION, &LobbyData::writeMemoryCallback);
@@ -1100,35 +1096,28 @@ std::string LobbyData::httpRequest(const std::string &url, const std::string &me
 	curl_easy_setopt(request_handle, CURLOPT_AUTOREFERER, 1L);
 	curl_easy_setopt(request_handle, CURLOPT_FOLLOWLOCATION, 1L);
 	curl_easy_setopt(request_handle, CURLOPT_TIMEOUT_MS, timeoutMs);
+	curl_easy_setopt(request_handle, CURLOPT_NOSIGNAL, 1L);
 	if (cancel) {
 		curl_easy_setopt(request_handle, CURLOPT_NOPROGRESS, 0L);
-		curl_easy_setopt(request_handle, CURLOPT_XFERINFOFUNCTION, +[](void *data, curl_off_t, curl_off_t, curl_off_t, curl_off_t) -> int {
+		curl_easy_setopt(request_handle, CURLOPT_XFERINFOFUNCTION, +[](void *data, curl_off_t, curl_off_t, curl_off_t, curl_off_t) noexcept -> int {
 			return !*static_cast<const std::atomic_bool *>(data);
 		});
 		curl_easy_setopt(request_handle, CURLOPT_XFERINFODATA, cancel);
 	}
 
-	request_chunk.memory = (char *)calloc(1, sizeof(char));
-	request_chunk.size = 0;
 	curl_easy_setopt(request_handle, CURLOPT_URL, url.c_str());
 	if (!data.empty())
 		curl_easy_setopt(request_handle, CURLOPT_POSTFIELDS, data.c_str());
 
+	if (cancel && !cancel->load()) throw std::runtime_error("HTTP request cancelled");
 	CURLcode res = curl_easy_perform(request_handle);
 
 	if (res != CURLE_OK) {
-		free(request_chunk.memory);
-		curl_slist_free_all(headers);
-		curl_easy_cleanup(request_handle);
 		throw std::runtime_error(curl_easy_strerror(res));
 	}
 
 	curl_easy_getinfo(request_handle, CURLINFO_RESPONSE_CODE, &response_code);
-	response = std::string(request_chunk.memory, request_chunk.memory + request_chunk.size);
-	free(request_chunk.memory);
-	curl_slist_free_all(headers);
-	curl_easy_cleanup(request_handle);
 	if (response_code >= 300)
-		throw std::invalid_argument("HTTP " + std::to_string(response_code) + ": " + response);
-	return response;
+		throw std::invalid_argument("HTTP " + std::to_string(response_code) + ": " + request_chunk.body);
+	return std::move(request_chunk.body);
 }

@@ -16,6 +16,7 @@ std::mutex logMutex;
 #include <Exceptions.hpp>
 #include "Connection.hpp"
 #include "getPublicIp.hpp"
+#include "ClientPerformance.hpp"
 #include "ipv6map_extern.hpp"
 
 #define print(...) do { if (this->_init) printf(__VA_ARGS__); } while(0)
@@ -101,23 +102,25 @@ Connection::Connection(const std::string &host, unsigned short port, const Playe
 
 Connection::~Connection()
 {
+	_ipLookupAlive = false;
 	this->_init = false;
-	{ std::lock_guard<std::mutex> lock(_sendMutex); this->_connected = false; }
-	_inbox.wake(); _sendReady.notify_all();
-	{
+	_stopTransport();
+	ClientConstructionGuard cleanup([this]() noexcept {
+		runClientCleanup("IP lookup join", [&] { if (_ipLookup.valid()) _ipLookup.wait(); });
+		runClientCleanup("connect thread join", [&] { if (_connectThread.joinable()) _connectThread.join(); });
+		runClientCleanup("receive thread join", [&] { if (_netThread.joinable()) _netThread.join(); });
+		runClientCleanup("send thread join", [&] { if (_sendThread.joinable()) _sendThread.join(); });
+		runClientCleanup("connection socket close", [&] { _socket.disconnect(); });
+	});
+	runClientCleanup("disconnect callback", [this] {
 		std::lock_guard<std::mutex> meMutexGuard(this->meMutex);
 		std::lock_guard<std::mutex> playerMutexGuard(this->_playerMutex);
 		std::lock_guard<std::mutex> functionMutexGuard(this->functionMutex);
-		if (!this->_disconnectNotified && this->onDisconnect)
+		if (!this->_disconnectNotified && this->onDisconnect) {
+			_disconnectNotified = true;
 			this->onDisconnect();
-	}
-	// Workers use nonblocking I/O and observe cancellation before the handle is closed.
-	if (this->_connectThread.joinable())
-		this->_connectThread.join();
-	if (this->_netThread.joinable())
-		this->_netThread.join();
-	if (_sendThread.joinable()) _sendThread.join();
-	_socket.disconnect();
+		}
+	});
 }
 
 void Connection::error(const std::string &msg)
@@ -129,28 +132,53 @@ void Connection::error(const std::string &msg)
 void Connection::_failTransport(const std::string &reason)
 {
 	{ std::lock_guard<std::mutex> lock(_errorMutex); if (_transportError.empty()) _transportError = reason; }
-	{ std::lock_guard<std::mutex> lock(_sendMutex); _connected = false; }
-	_inbox.wake(); _sendReady.notify_all();
+	_stopTransport();
+}
+
+void Connection::_stopTransport()
+{
+	stopClientWaiter(_connected, _sendMutex, _sendReady);
+	_inbox.wake();
 }
 
 void Connection::startThread()
 {
-	{ std::lock_guard<std::mutex> lock(clientRegistryMutex); clientRegistry.emplace_back(shared_from_this()); }
-	this->_connectThread = std::thread([this](){
-		try {
-			this->_socket.connectWithTimeout(this->_host, this->_port, std::chrono::seconds(6), _connected);
-			{ std::lock_guard<std::mutex> lock(_sendMutex); if (_connected) this->_hasConnected = true; }
-			_sendReady.notify_all();
-		} catch (std::exception &e) {
-			this->error(e.what());
-		}
+	ClientConstructionGuard rollback([this]() noexcept {
+		_stopTransport();
+		if (_connectThread.joinable()) _connectThread.join();
+		if (_netThread.joinable()) _netThread.join();
+		if (_sendThread.joinable()) _sendThread.join();
+		_socket.disconnect();
 	});
-	this->_netThread = std::thread{&Connection::_netLoop, this};
-	_sendThread = std::thread(&Connection::_sendLoop, this);
+	{ std::lock_guard<std::mutex> lock(clientRegistryMutex); clientRegistry.emplace_back(shared_from_this()); }
+	this->_connectThread = std::thread(&Connection::_runWorker, this, &Connection::_connectLoop, "connect");
+	this->_netThread = std::thread(&Connection::_runWorker, this, &Connection::_netLoop, "receive");
+	_sendThread = std::thread(&Connection::_runWorker, this, &Connection::_sendLoop, "send");
+	rollback.dismiss();
+}
+
+void Connection::_connectLoop()
+{
+	_socket.connectWithTimeout(_host, _port, std::chrono::seconds(6), _connected);
+	{ std::lock_guard<std::mutex> lock(_sendMutex); if (_connected) _hasConnected = true; }
+	_sendReady.notify_all();
+}
+
+void Connection::_runWorker(void (Connection::*work)(), const char *label) noexcept
+{
+	runClientWorker([&] { (this->*work)(); }, [&](const char *reason) {
+		fprintf(stderr, "Lobby %s worker failed: %s\n", label, reason);
+		_failTransport(std::string("Lobby ") + label + " worker failed: " + reason);
+	}, [this] {
+		// Allocation-free fallback, even if constructing the error text failed.
+		_stopTransport();
+	});
 }
 
 void Connection::send(const void *packet, size_t size)
 {
+	if (size && *static_cast<const uint8_t *>(packet) == Lobbies::OPCODE_ARCADE_LEAVE)
+		_gameInfoPending = false;
 	if (!size || !_connected) return;
 	bool overflow = false;
 	{
@@ -261,13 +289,15 @@ void Connection::_pumpEvents(std::chrono::steady_clock::time_point deadline)
 		catch (const std::exception &e) { _failTransport(e.what()); _inbox.clear(); break; }
 		if (_receivedKick) { _inbox.clear(); break; }
 	}
+	_finishGameInfo();
 	if (!_connected && _inbox.empty() && !_disconnectNotified) {
 		_disconnectNotified = true; _init = false; _helloPending = false;
 		std::lock_guard<std::mutex> lock(functionMutex);
-		std::string reason;
-		{ std::lock_guard<std::mutex> errorLock(_errorMutex); reason = _transportError; }
-		if (!_receivedKick && !reason.empty() && onError) onError(reason);
-		if (onDisconnect) onDisconnect();
+		runClientDisconnectCallbacks([&] {
+			std::string reason;
+			{ std::lock_guard<std::mutex> errorLock(_errorMutex); reason = _transportError; }
+			if (!_receivedKick && !reason.empty() && onError) onError(reason);
+		}, [&] { if (onDisconnect) onDisconnect(); });
 	}
 	_skippedChat += _inbox.takeDropped();
 	if (_init && _skippedChat && std::chrono::steady_clock::now() - _lastChatNotice >= std::chrono::seconds(5)) {
@@ -280,6 +310,7 @@ void Connection::_pumpEvents(std::chrono::steady_clock::time_point deadline)
 
 void Connection::pumpNetworkEvents()
 {
+	ClientPerformance::Scope performance(ClientPerformance::Stage::NetworkPump);
 	std::vector<std::shared_ptr<Connection>> connections;
 	{
 		std::lock_guard<std::mutex> lock(clientRegistryMutex);
@@ -289,6 +320,20 @@ void Connection::pumpNetworkEvents()
 		}
 	}
 	static size_t cursor = 0;
+#ifdef SOKU_CLIENT_PERFORMANCE
+	static uint64_t lastSnapshot = 0;
+	if (ClientPerformance::snapshotDue(lastSnapshot)) {
+		size_t frames = 0, bytes = 0, outgoing = 0;
+		for (const auto &connection : connections) {
+			const auto inbox = connection->_inbox.sizeSnapshot(); frames += inbox.first; bytes += inbox.second;
+			std::lock_guard<std::mutex> lock(connection->_sendMutex); outgoing += connection->_outgoingBytes;
+		}
+		ClientPerformance::gauge(ClientPerformance::Gauge::Connections, connections.size());
+		ClientPerformance::gauge(ClientPerformance::Gauge::InboxFrames, frames);
+		ClientPerformance::gauge(ClientPerformance::Gauge::InboxBytes, bytes);
+		ClientPerformance::gauge(ClientPerformance::Gauge::SendBytes, outgoing);
+	}
+#endif
 	const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(2);
 	for (size_t i = 0; i < connections.size() && std::chrono::steady_clock::now() < deadline; ++i) {
 		auto &connection = connections[(cursor + i) % connections.size()];
@@ -470,8 +515,7 @@ bool Connection::_handlePacket(const Lobbies::PacketKicked &packet, size_t &size
 		this->onImpMsg("Kicked: " + reason);
 	this->_init = false;
 	_receivedKick = true;
-	{ std::lock_guard<std::mutex> lock(_sendMutex); this->_connected = false; }
-	_inbox.wake(); _sendReady.notify_all();
+	_stopTransport();
 	return true;
 }
 
@@ -499,6 +543,7 @@ bool Connection::_handlePacket(const Lobbies::PacketPosition &packet, size_t &si
 		return false;
 	}
 	size -= sizeof(packet);
+	if (!validClientBattleStatus(packet.status)) return true;
 	auto player = this->_players.find(packet.id);
 	if (player != this->_players.end()) {
 		player->second.pos = {packet.x, packet.y};
@@ -615,8 +660,10 @@ bool Connection::_handlePacket(const Lobbies::PacketArcadeLeave &packet, size_t 
 		return false;
 	}
 	size -= sizeof(packet);
-	if (this->_me && packet.id == this->_me->id)
+	if (this->_me && packet.id == this->_me->id) {
 		this->_spectatingArcade = false;
+		_gameInfoPending = false;
+	}
 	auto player = this->_players.find(packet.id);
 	if (player == this->_players.end())
 		return true;
@@ -677,6 +724,7 @@ bool Connection::_handlePacket(const Lobbies::PacketBattleStatusUpdate &packet, 
 		return false;
 	}
 	size -= sizeof(packet);
+	if (!validClientBattleStatus(packet.newStatus)) return true;
 	auto player = this->_players.find(packet.playerId);
 	if (player != this->_players.end())
 		player->second.battleStatus = packet.newStatus;
@@ -734,6 +782,7 @@ void Connection::_sendHello()
 
 void Connection::disconnect()
 {
+	_gameInfoPending = false;
 	if (!this->_init && !_helloPending)
 		return;
 
@@ -867,35 +916,50 @@ void Connection::setInitialPlayer(const Player &player)
 
 bool Connection::sendGameInfo()
 {
-	const char *ip;
-	std::string ipv6;
+	if (!_init || !_connected || !_me) return false;
+	// Capture the game callbacks now, on the game thread. The worker only does I/O.
+	_gameInfoPort = onHostRequest();
+	_gameInfoSession = _session.load();
+	_gameInfoMachine = _me->machineId;
+	_gameInfoPending = true;
 	try {
-		ip = getMyIp();
-		if (isIpv6Available())
-			ipv6 = getMyIpv6();
-	} catch (std::exception &e) {
-		this->error(std::string("Failed to get public IP: ") + e.what());
+		if (!_ipLookup.valid())
+			_ipLookup = std::async(std::launch::async, [this] {
+				auto ip = getMyIp(&_ipLookupAlive);
+				return std::make_pair(std::move(ip), getMyIpv6());
+			});
+	} catch (const std::exception &e) {
+		_gameInfoPending = false;
+		error(std::string("Failed to get public IP: ") + e.what());
 		return false;
 	}
-	unsigned short port = this->onHostRequest();
-	unsigned short port6 = ipv6.empty() ? 0 : port;
-	// if (ipv6)
-	// 	print("My ipv6: %s\n", ipv6);
-	auto dup = strdup(ip);
-	char *pos = strchr(dup, ':');
-
-	if (pos) {
-		try {
-			port = std::stoul(pos + 1);
-		} catch (std::exception &e) {
-			puts(e.what());
-		}
-		*pos = 0;
-	}
-
-	Lobbies::PacketGameStart game{dup, port, port6 ? ipv6 : "", port6, false};
-
-	free(dup);
-	this->send(&game, sizeof(game));
 	return true;
+}
+
+void Connection::_finishGameInfo()
+{
+	if (!_ipLookup.valid() || _ipLookup.wait_for(std::chrono::seconds(0)) != std::future_status::ready)
+		return;
+	const bool publish = _gameInfoPending && _connected && _init && _me &&
+		validClientGameInfoResult(_gameInfoSession, _session.load(), _gameInfoMachine, _me->machineId, _me->battleStatus);
+	_gameInfoPending = false;
+	try {
+		auto addresses = _ipLookup.get();
+		if (!publish) return;
+		auto &ip = addresses.first;
+		auto port = _gameInfoPort;
+		const auto port6 = addresses.second.empty() ? 0 : port;
+		const auto separator = ip.find(':');
+		if (separator != std::string::npos) {
+			try { port = static_cast<unsigned short>(std::stoul(ip.substr(separator + 1))); }
+			catch (const std::exception &e) { puts(e.what()); }
+			ip.resize(separator);
+		}
+		Lobbies::PacketGameStart game{ip.c_str(), port, port6 ? addresses.second : "", static_cast<unsigned short>(port6), false};
+		send(&game, sizeof(game));
+	} catch (const std::exception &e) {
+		if (publish) error(std::string("Failed to get public IP: ") + e.what());
+	} catch (...) {
+		if (publish) error("Failed to get public IP: Unknown IP lookup error");
+	}
 }
