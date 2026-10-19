@@ -2061,15 +2061,19 @@ int InLobbyMenu::onRender()
 				continue;
 			auto &name = playerData->second.name;
 			int nameMarker = 0;
+			bool hasNameMarker = false;
 			if (showNameMarkers && player.id != nameMarkerMe->id) {
 				RelativeRatings::Rating rating;
 				if (lobbyData->relativeRatings().lookup(player.name, rating)) {
-					if (nameMarkerOwnRating.value - rating.value >= 100) nameMarker = 1;
-					else if (rating.value - nameMarkerOwnRating.value >= 300) nameMarker = -1;
+					hasNameMarker = true;
+					const auto difference = rating.value - nameMarkerOwnRating.value;
+					const auto magnitude = std::abs(difference);
+					const int arrows = magnitude <= 100 ? 0 : magnitude >= 300 ? 3 : magnitude > 200 ? 2 : 1;
+					nameMarker = difference < 0 ? arrows : -arrows;
 				}
 			}
-			// Include the triangle on its actual side in name collision detection.
-			const int leftPadding = nameMarker ? 14 : 0;
+			// Reserve the same left-side space for stacked arrows and the equal sign.
+			const int leftPadding = hasNameMarker ? 14 : 0;
 			const int rightPadding = 0;
 			auto minPos = this->_translate.x + player.pos.x * this->_zoom - name.getSize().x / 2.f - leftPadding;
 			auto maxPos = this->_translate.x + player.pos.x * this->_zoom + name.getSize().x / 2.f + rightPadding;
@@ -2114,30 +2118,50 @@ int InLobbyMenu::onRender()
 			auto row = std::clamp(static_cast<int>(std::floor(posY / 20.f)), firstNameRow, lastNameRow);
 			nameRows[row - firstNameRow].push_back({minPos, maxPos, posY});
 			const auto originalTint = name.tint;
-			const auto markerColor = nameMarker > 0 ? SokuLib::Color{143, 224, 173, 255} : SokuLib::Color{242, 145, 153, 255};
-			if (nameMarker)
+			const auto markerColor = nameMarker == 0 ? SokuLib::Color{145, 205, 242, 255} :
+				nameMarker > 0 ? SokuLib::Color{143, 224, 173, 255} : SokuLib::Color{242, 145, 153, 255};
+			if (hasNameMarker)
 				name.tint = markerColor;
 			name.draw();
 			name.tint = originalTint;
-			if (nameMarker) {
-				const int top = static_cast<int>(posY) + (std::max)(0, (static_cast<int>(name.getSize().y) - 5) / 2);
+			if (hasNameMarker) {
+				const int arrowCount = std::abs(nameMarker);
+				const int iconHeight = arrowCount ? 7 + (arrowCount - 1) * 3 : 6;
+				const int top = static_cast<int>(posY) + (std::max)(0, (static_cast<int>(name.getSize().y) - iconHeight) / 2);
 				auto segment = [](int x, int y, unsigned width, unsigned height, SokuLib::Color fill) {
-					SokuLib::DrawUtils::RectangleShape shape;
-					shape.setPosition({x, y});
-					shape.setSize({width, height});
-					shape.setFillColor(fill);
-					shape.setBorderColor({0, 0, 0, 0});
-					shape.draw();
+					// Screen-space quads avoid RectangleShape's asymmetric corner offsets,
+					// which distort very small symbols into slanted bars.
+					const float left = x - 0.5f, right = left + width;
+					const float top = y - 0.5f, bottom = top + height;
+					SokuLib::DrawUtils::Vertex vertices[] = {
+						{left, top, 0, 1, fill, 0, 0}, {right, top, 0, 1, fill, 0, 0},
+						{right, bottom, 0, 1, fill, 0, 0}, {left, bottom, 0, 1, fill, 0, 0}
+					};
+					SokuLib::textureMgr.setTexture(0, 0);
+					SokuLib::pd3dDev->DrawPrimitiveUP(D3DPT_TRIANGLEFAN, 2, vertices, sizeof(*vertices));
 				};
 				const int x = static_cast<int>(minPos) + 2;
-				// Both markers sit on the left: green points down, red points up.
-				for (int pass = 0; pass < 2; ++pass) {
-					const int shadow = pass == 0 ? 1 : 0;
-					const auto ink = pass == 0 ? SokuLib::Color{12, 18, 25, 230} : markerColor;
-					for (int line = 0; line < 5; ++line) {
-						const int inset = nameMarker > 0 ? line : 4 - line;
-						segment(x + inset + shadow, top + line + shadow, 9 - inset * 2, 1, ink);
+				const auto outline = SokuLib::Color{12, 18, 25, 255};
+				if (!arrowCount) {
+					for (int bar = 0; bar < 2; ++bar) {
+						segment(x - 1, top + bar * 4 - 1, 11, 3, outline);
+						segment(x, top + bar * 4, 9, 1, markerColor);
 					}
+				} else for (int arrow = 0; arrow < arrowCount; ++arrow) {
+					// Stagger complete stemmed arrows instead of rank-like chevrons.
+					// Each additional arrow overlaps slightly, within a fixed nine-pixel width.
+					const int arrowX = x + (3 - arrowCount) + arrow * 2;
+					const int arrowTop = top + arrow * 3;
+					for (int pass = 0; pass < 2; ++pass)
+						for (int line = 0; line < 7; ++line) {
+							const int headRow = nameMarker > 0 ? 6 - line : line;
+							const int width = headRow < 3 ? 1 + headRow * 2 : 1;
+							const int left = arrowX + (5 - width) / 2;
+							if (!pass)
+								segment(left - 1, arrowTop + line - 1, width + 2, 3, outline);
+							else
+								segment(left, arrowTop + line, width, 1, markerColor);
+						}
 				}
 			}
 		}

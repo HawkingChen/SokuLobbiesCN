@@ -717,13 +717,13 @@ void OptionsMenu::_refreshRatingSettings()
 			L"\u5728\u5927\u5385\u663E\u793A\u7B49\u7EA7\u5206\u5361\u7247\u3002\u6570\u636E\u5728\u540E\u53F0\u52A0\u8F7D\u5E76\u7F13\u5B58\u3002",
 			L"\u81EA\u52A8\u663E\u793A\u6700\u8FD1\u73A9\u5BB6\uFF1B\u6309 F8 \u4E34\u65F6\u5207\u6362\u4E0B\u4E00\u4F4D\u3002\n\u79FB\u52A8\u540E\u6062\u590D\u81EA\u52A8\u8DDF\u968F\u3002F10 \u4E34\u65F6\u9690\u85CF/\u6062\u590D\u5361\u7247\u3002",
 			L"\u5728\u5DE6\u4E0A\u89D2\u663E\u793A\u81EA\u5DF1\u7684\u7B49\u7EA7\u5206\u5361\u7247\u3002",
-			L"\u7EFF\u540D + \u5DE6\u4FA7\u25BC\uFF1A\u6BD4\u4F60\u4F4E\u81F3\u5C11 100 \u5206\u3002\n\u7EA2\u540D + \u5DE6\u4FA7\u25B2\uFF1A\u6BD4\u4F60\u9AD8\u81F3\u5C11 300 \u5206\u3002",
+			L"\u7EA2\u8272\u4E0A\u7BAD\u5934\uFF1A\u9AD8\u4E8E\u4F60\uFF1B\u7EFF\u8272\u4E0B\u7BAD\u5934\uFF1A\u4F4E\u4E8E\u4F60\u3002\n\u5206\u5DEE >100 / >200 / >=300\uFF1A1 / 2 / 3 \u4E2A\u7BAD\u5934\u3002\n\u76F8\u5DEE 100 \u5206\u4EE5\u5185\uFF1A\u84DD\u8272\u7B49\u53F7\u3002",
 			L"\u8C03\u6574\u9644\u8FD1\u73A9\u5BB6\u7684\u5361\u7247\u4F4D\u7F6E\uFF0C\u9760\u8FD1\u5C4F\u5E55\u8FB9\u7F18\u65F6\u81EA\u52A8\u907F\u8BA9\u3002"
 	} : std::vector<std::wstring>{
 			L"Show rating cards. Data loads and caches in the background.",
 			L"Auto shows the nearest player. F8 temporarily cycles to the next player; moving restores auto-follow.\nF10 temporarily hides/shows the card (settings unchanged).",
 			L"Show your own rating card in the top-left corner.",
-			L"Green name + left \u25BC: at least 100 points below you.\nRed name + left \u25B2: at least 300 points above you.",
+			L"Red up: higher; green down: lower.\nGap >100 / >200 / >=300: 1 / 2 / 3 arrows.\nWithin 100 points: blue equals sign.",
 			L"Place nearby player cards. Cards stay inside the screen."
 	};
 	createLocalizedSprite(this->_ratingDescription, descriptions[this->_ratingCursor], 12, {518, 52});
