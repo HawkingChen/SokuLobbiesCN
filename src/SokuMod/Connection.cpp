@@ -177,6 +177,15 @@ void Connection::_runWorker(void (Connection::*work)(), const char *label) noexc
 
 void Connection::send(const void *packet, size_t size)
 {
+	if (size == sizeof(Lobbies::PacketMessage) && *static_cast<const uint8_t *>(packet) == Lobbies::OPCODE_MESSAGE) {
+		const auto &message = *static_cast<const Lobbies::PacketMessage *>(packet);
+		const std::string_view text(message.message, strnlen(message.message, sizeof(message.message)));
+		// Internal synchronization must never keep an otherwise idle player alive.
+		if (_init && !IdleTracking::isControl(text) && text.substr(0, 8) != "/__block") {
+			std::lock_guard<std::mutex> lock(_idleMutex);
+			_idleClock.active(IdleTracking::Clock::now());
+		}
+	}
 	if (size && *static_cast<const uint8_t *>(packet) == Lobbies::OPCODE_ARCADE_LEAVE)
 		_gameInfoPending = false;
 	if (!size || !_connected) return;
@@ -306,6 +315,32 @@ void Connection::_pumpEvents(std::chrono::steady_clock::time_point deadline)
 		_skippedChat = 0; _lastChatNotice = std::chrono::steady_clock::now();
 	}
 	_publishHeartbeat();
+	_updateIdleReport();
+}
+
+void Connection::_updateIdleReport()
+{
+	if (!_init || !_me) return;
+	const auto now = IdleTracking::Clock::now();
+	const auto playingScene = [](SokuLib::Scene scene) {
+		return scene == SokuLib::SCENE_SELECTCL || scene == SokuLib::SCENE_SELECTSV ||
+			scene == SokuLib::SCENE_LOADINGCL || scene == SokuLib::SCENE_LOADINGSV ||
+			scene == SokuLib::SCENE_BATTLECL || scene == SokuLib::SCENE_BATTLESV;
+	};
+	const bool spectating = _spectatingScene || _spectatingArcade || _me->battleStatus == Lobbies::BATTLE_STATUS_SPECTATING;
+	const bool exempt = !spectating && (_me->battleStatus == Lobbies::BATTLE_STATUS_WAITING ||
+		_me->battleStatus == Lobbies::BATTLE_STATUS_PLAYING || playingScene(SokuLib::sceneId) || playingScene(SokuLib::newSceneId));
+	std::string command;
+	{
+		std::lock_guard<std::mutex> lock(_idleMutex);
+		_idleClock.setExempt(exempt, now);
+		if (!_idleClock.due(now)) return;
+		command = "/__idle " + std::to_string(_idleClock.idle(now).count()) + (exempt ? " 1" : " 0");
+		_idleClock.lastReport = now;
+		_idleClock.dirty = false;
+	}
+	Lobbies::PacketMessage report{0, 0, command};
+	send(&report, sizeof(report));
 }
 
 void Connection::pumpNetworkEvents()
@@ -431,6 +466,10 @@ bool Connection::_handlePacket(const Lobbies::PacketOlleh &packet, size_t &size)
 	this->_me = &this->_players[packet.id];
 	this->_init = true;
 	this->_helloPending = false;
+	this->_spectatingArcade = false; // Machine membership belongs to the new lobby session.
+	{ std::lock_guard<std::mutex> lock(_idleMutex); _idleClock.reset(IdleTracking::Clock::now()); }
+	Lobbies::PacketMessage idleCapability{0, 0, "/__idlecap"};
+	send(&idleCapability, sizeof(idleCapability));
 	if (this->onConnect)
 		this->onConnect(packet);
 	return true;
@@ -687,6 +726,20 @@ bool Connection::_handlePacket(const Lobbies::PacketMessage &packet, size_t &siz
 		return false;
 	}
 	size -= sizeof(packet);
+	const std::string text(packet.message, strnlen(packet.message, sizeof(packet.message)));
+	if (_init && packet.playerId == 0) {
+		if (packet.channelId == Lobbies::BLOCKLIST_CONTROL_CHANNEL && text == "IDLECAP1") {
+			std::lock_guard<std::mutex> lock(_idleMutex);
+			_idleClock.supported = true;
+			_idleClock.dirty = true;
+			return true;
+		}
+		// Older servers reject the one-time capability query. Hide only its
+		// specific unknown-command response, not ordinary errors or player text.
+		if (text.find("__idlecap") != std::string::npos &&
+			(text.find("Unknown command") != std::string::npos || text.find("未知指令") != std::string::npos))
+			return true;
+	}
 	if (this->onMsg) {
 		// The packet dispatcher already holds _playerMutex. Resolve and copy
 		// the current name here so callbacks never need to lock it again.

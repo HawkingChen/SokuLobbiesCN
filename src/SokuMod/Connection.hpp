@@ -17,6 +17,7 @@
 #include "Socket.hpp"
 #include "LobbyData.hpp"
 #include "ClientTransport.hpp"
+#include "IdleTracking.hpp"
 #include <memory>
 #include <condition_variable>
 #include <future>
@@ -76,6 +77,8 @@ private:
 	std::atomic_llong _lastSpectatingAtMs{0};
 	char _uniqueId[16];
 	std::string _name;
+	std::mutex _idleMutex;
+	IdleTracking::LocalClock _idleClock;
 	Socket _socket;
 	LobbyInfo _info;
 	Player _initParams;
@@ -95,6 +98,7 @@ private:
 	void _stopTransport();
 	void _publishHeartbeat();
 	void _queueHeartbeat();
+	void _updateIdleReport();
 	void _pumpEvents(std::chrono::steady_clock::time_point deadline);
 	void _finishGameInfo();
 	bool _handlePacket(const Lobbies::Packet &packet, size_t &size);
