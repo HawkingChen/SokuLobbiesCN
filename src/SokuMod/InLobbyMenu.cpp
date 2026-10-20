@@ -5707,7 +5707,7 @@ void InLobbyMenu::_startHosting()
 		this->_hostThread.join();
 	this->_hostThread = std::thread{[this, ranked]{
 		std::string converted;
-		const char * ip;
+		std::string ip;
 		try {
 			ip = getMyIp();
 		} catch (std::exception &e) {
@@ -5716,7 +5716,7 @@ void InLobbyMenu::_startHosting()
 		}
 
 		unsigned short port = hostPort;
-		auto dup = strdup(ip);
+		auto dup = strdup(ip.c_str());
 		char *pos = strchr(dup, ':');
 		std::string name;
 
