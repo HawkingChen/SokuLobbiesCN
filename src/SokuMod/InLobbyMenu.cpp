@@ -33,6 +33,7 @@
 #include "InputBox.hpp"
 #include "Utf8Name.hpp"
 #include "ClientPerformance.hpp"
+#include "NearbyRatingCards.hpp"
 
 #define CHAT_CHARACTER_LIMIT 512
 #define BOX_TEXTURE_SIZE {0x2000, 30}
@@ -69,6 +70,18 @@ static std::mutex ptrMutex;
 static std::mt19937 random;
 
 namespace {
+	std::wstring ratingCharacterName(const std::string &code) {
+		static const std::map<std::string, std::wstring> names = {
+			{"reimu", L"灵梦"}, {"marisa", L"魔理沙"}, {"sakuya", L"咲夜"}, {"alice", L"爱丽丝"},
+			{"patchouli", L"帕秋莉"}, {"youmu", L"妖梦"}, {"remilia", L"蕾米"}, {"yuyuko", L"幽幽子"},
+			{"yukari", L"紫"}, {"suika", L"萃香"}, {"reisen", L"铃仙"}, {"aya", L"文"}, {"komachi", L"小町"},
+			{"iku", L"衣玖"}, {"tenshi", L"天子"}, {"sanae", L"早苗"}, {"cirno", L"琪露诺"},
+			{"meiling", L"美铃"}, {"utsuho", L"空"}, {"suwako", L"诹访子"}
+		};
+		const auto found = names.find(code);
+		if (found != names.end()) return found->second;
+		return convertEncoding<char, wchar_t, UTF8Decode, UTF16Encode>(code);
+	}
 	void transferLobbyTexture(SokuLib::DrawUtils::Texture &from, SokuLib::DrawUtils::Texture &to) {
 		if (!from.hasTexture()) return;
 		const auto size = from.getSize();
@@ -2208,26 +2221,30 @@ void InLobbyMenu::_updateRelativeRatingTarget()
 		!inputBoxShown && GetForegroundWindow() == SokuLib::window;
 	if (this->_relativeRatingLastConfiguredMode != relativeRatingMode) {
 		this->_relativeRatingLastConfiguredMode = relativeRatingMode;
-		this->_relativeRatingHotkeyMode = -1;
 		this->_relativeRatingF8Override = false;
 		if (relativeRatingMode != 0)
 			this->_relativeRatingTarget = UINT32_MAX;
 	}
-	int displayMode = this->_relativeRatingHotkeyMode >= 0 ? this->_relativeRatingHotkeyMode : static_cast<int>(relativeRatingMode);
+	int displayMode = static_cast<int>(relativeRatingMode);
 	bool restoredFromHotkeyOff = false;
 	if (controlsAllowed && f10Pressed && relativeRatingsEnabled && lobbyData && this->_connection->isInit()) {
-		if (displayMode == 2) {
-			this->_relativeRatingHotkeyMode = relativeRatingMode == 2 ? 0 : static_cast<int>(relativeRatingMode);
-			displayMode = this->_relativeRatingHotkeyMode;
-			restoredFromHotkeyOff = true;
+		const unsigned nextMode = relativeRatingMode == 2 ? 0u : 2u;
+		if (IniConfig::writeLobbyUnsigned(profilePath, L"RelativeRatingMode", nextMode)) {
+			relativeRatingMode = nextMode;
+			this->_relativeRatingLastConfiguredMode = nextMode;
+			displayMode = static_cast<int>(nextMode);
+			restoredFromHotkeyOff = nextMode == 0;
+			this->_relativeRatingF8Override = false;
+			this->_relativeRatingTarget = UINT32_MAX;
+			this->_relativeRatingCandidate = UINT32_MAX;
 		} else {
-			this->_relativeRatingHotkeyMode = 2;
-			displayMode = 2;
+			this->_addMessageToList(0xFF8080, 0, chineseLanguage ?
+				"无法保存等级分卡片设置，请检查配置文件是否可写。" :
+				"Could not save rating card settings. Check that the config file is writable.");
 		}
 	}
 
 	if (!relativeRatingsEnabled || !lobbyData || !this->_connection->isInit()) {
-		this->_relativeRatingHotkeyMode = -1;
 		this->_relativeRatingTarget = UINT32_MAX;
 		this->_relativeRatingCandidate = UINT32_MAX;
 		this->_relativeRatingF8Override = false;
@@ -2332,19 +2349,6 @@ void InLobbyMenu::_renderRelativeRatings()
 	const auto me = this->_connection->getMe();
 	if (!me)
 		return;
-	auto characterName = [](const std::string &code) {
-		static const std::map<std::string, std::wstring> names = {
-			{"reimu", L"\u7075\u68A6"}, {"marisa", L"\u9B54\u7406\u6C99"}, {"sakuya", L"\u54B2\u591C"}, {"alice", L"\u7231\u4E3D\u4E1D"},
-			{"patchouli", L"\u5E15\u79CB\u8389"}, {"youmu", L"\u5996\u68A6"}, {"remilia", L"\u857E\u7C73"}, {"yuyuko", L"\u5E7D\u5E7D\u5B50"},
-			{"yukari", L"\u7D2B"}, {"suika", L"\u8403\u9999"}, {"reisen", L"\u94C3\u4ED9"}, {"aya", L"\u6587"}, {"komachi", L"\u5C0F\u753A"},
-			{"iku", L"\u8863\u7396"}, {"tenshi", L"\u5929\u5B50"}, {"sanae", L"\u65E9\u82D7"}, {"cirno", L"\u742A\u9732\u8BFA"},
-			{"meiling", L"\u7F8E\u94C3"}, {"utsuho", L"\u7A7A"}, {"suwako", L"\u8B39\u8BBF\u5B50"}
-		};
-		auto found = names.find(code);
-		if (found != names.end())
-			return found->second;
-		return convertEncoding<char, wchar_t, UTF8Decode, UTF16Encode>(code);
-	};
 	auto portraitFor = [&](const std::string &code) -> SokuLib::DrawUtils::Sprite * {
 		// Use the same character emote icons as the spectator list.
 		const auto found = lobbyData->emotesByName.find(code + "1");
@@ -2356,10 +2360,7 @@ void InLobbyMenu::_renderRelativeRatings()
 		const auto playerName = convertEncoding<char, wchar_t, UTF8Decode, UTF16Encode>(ClientNames::displayName(player.name));
 		lines.push_back(playerName);
 		if (!lobbyData->relativeRatings().lookup(player.name, rating)) {
-			if (!lobbyData->relativeRatings().hasData())
-				lines.push_back(chineseLanguage ? L"\u8BC4\u5206\u6570\u636E\u672A\u8F7D\u5165" : L"Ratings data not loaded");
-			else
-				lines.push_back(chineseLanguage ? L"\u8BC4\u5206\u672A\u77E5" : L"Rating unavailable");
+			lines.push_back(RatingRequests::text(lobbyData->relativeRatings().requestStatus(player.name), chineseLanguage));
 			return lines;
 		}
 		wchar_t score[96];
@@ -2371,12 +2372,13 @@ void InLobbyMenu::_renderRelativeRatings()
 			if (portraitFor(character.code))
 				std::swprintf(line, 80, L"%.0f", character.rating);
 			else
-				std::swprintf(line, 80, L"%ls  %.0f", characterName(character.code).c_str(), character.rating);
+				std::swprintf(line, 80, L"%ls  %.0f", ratingCharacterName(character.code).c_str(), character.rating);
 			lines.emplace_back(line);
 		}
 		return lines;
 	};
-	auto drawCard = [&](uint32_t id, const Player &player, bool own, int anchorX, int anchorY) {
+	auto drawCard = [&](uint32_t id, const Player &player, bool own, int anchorX, int anchorY,
+		bool measureOnly = false, std::optional<SokuLib::Vector2i> position = std::nullopt) {
 		auto lines = makeLines(player, own);
 		std::string fingerprint;
 		for (const auto &line : lines) {
@@ -2443,6 +2445,7 @@ void InLobbyMenu::_renderRelativeRatings()
 		if (characterCount)
 			width = (std::max)(width, columnWidths[0] + columnWidths[1] + (characterCount > 1 ? 32 : 20));
 		width = (std::min)(width, 320);
+		if (measureOnly) return SokuLib::Vector2i{width, height};
 		int x = own ? 8 : anchorX - width / 2 + relativeRatingOffsetX;
 		int y = own ? 8 : anchorY - height - 52 + relativeRatingOffsetY;
 		if (!own && relativeRatingPosition == 1)
@@ -2455,6 +2458,7 @@ void InLobbyMenu::_renderRelativeRatings()
 		}
 		x = (std::clamp)(x, 4, 636 - width);
 		y = (std::clamp)(y, 4, 476 - height);
+		if (position) { x = position->x; y = position->y; }
 		auto rectangle = [](int left, int top, unsigned width, unsigned height, SokuLib::Color fill, SokuLib::Color border) {
 			SokuLib::DrawUtils::RectangleShape shape;
 			shape.setPosition({left, top});
@@ -2506,15 +2510,34 @@ void InLobbyMenu::_renderRelativeRatings()
 			card.lines[i].setPosition({x + columnX + (portrait ? 30 : 6), y + rowY});
 			card.lines[i].draw();
 		}
+		return SokuLib::Vector2i{width, height};
 	};
 	for (const auto &player : this->_playersCopy) {
 		if (player.id == me->id && relativeRatingShowOwn)
 			drawCard(player.id, player, true, 0, 0);
-		else if ((this->_relativeRatingHotkeyMode >= 0 ? this->_relativeRatingHotkeyMode : static_cast<int>(relativeRatingMode)) != 2 && player.id == this->_relativeRatingTarget)
-			drawCard(player.id, player, false,
-				static_cast<int>(this->_translate.x + player.pos.x * this->_zoom),
-				static_cast<int>(this->_translate.y + player.pos.y * this->_zoom));
 	}
+	if (relativeRatingMode == 2) return;
+	const auto primary = this->_playersById.find(this->_relativeRatingTarget);
+	if (primary == this->_playersById.end() || !primary->second || primary->second->id == me->id) return;
+	const auto &player = *primary->second;
+	const int anchorX = static_cast<int>(this->_translate.x + player.pos.x * this->_zoom);
+	const int anchorY = static_cast<int>(this->_translate.y + player.pos.y * this->_zoom);
+	const auto secondId = NearbyRatingCards::secondTarget(this->_playersCopy, me->id, me->pos.x, me->pos.y,
+		player.id, relativeRatingMode != 0 || this->_relativeRatingF8Override);
+	const auto secondary = this->_playersById.find(secondId);
+	if (secondary == this->_playersById.end() || !secondary->second) {
+		drawCard(player.id, player, false, anchorX, anchorY);
+		return;
+	}
+	// Measure both cards first, then clamp the complete stack as one group so
+	// the second card cannot slide up over the first near the screen bottom.
+	const auto firstSize = drawCard(player.id, player, false, anchorX, anchorY, true);
+	const auto &secondPlayer = *secondary->second;
+	const auto secondSize = drawCard(secondPlayer.id, secondPlayer, false, anchorX, anchorY, true);
+	const auto layout = NearbyRatingCards::stackPosition({firstSize.x, firstSize.y}, {secondSize.x, secondSize.y},
+		anchorX, anchorY, relativeRatingPosition, relativeRatingOffsetX, relativeRatingOffsetY);
+	drawCard(player.id, player, false, anchorX, anchorY, false, SokuLib::Vector2i{layout.x, layout.y});
+	drawCard(secondPlayer.id, secondPlayer, false, anchorX, anchorY, false, SokuLib::Vector2i{layout.x, layout.secondY});
 }
 
 void InLobbyMenu::_unhook()
@@ -4057,6 +4080,115 @@ bool InLobbyMenu::_handleLocalTeleport(const std::wstring &msg)
 	return true;
 }
 
+bool InLobbyMenu::_handleLocalRating(const std::wstring &msg)
+{
+	constexpr size_t commandSize = 7;
+	if (msg.size() < commandSize || _wcsnicmp(msg.c_str(), L"/rating", commandSize) != 0 ||
+		(msg.size() > commandSize && !iswspace(msg[commandSize]))) return false;
+	auto error = [this](const char *zh, const char *en) {
+		this->_addMessageToList(0xFF0000, 0, chineseLanguage ? zh : en);
+	};
+	auto argument = msg.substr(commandSize);
+	const auto begin = argument.find_first_not_of(L" \t\r\n");
+	if (begin == std::wstring::npos) {
+		error("用法：/rating <玩家 ID 或 @玩家名>", "Usage: /rating <player ID or @name>");
+		return true;
+	}
+	argument = argument.substr(begin, argument.find_last_not_of(L" \t\r\n") - begin + 1);
+	std::string name;
+	try {
+		if (argument.front() == L'@') {
+			std::wstring unescaped;
+			for (size_t i = 1; i < argument.size(); ++i) {
+				if (argument[i] == L'\\' && i + 1 < argument.size()) ++i;
+				unescaped += argument[i];
+			}
+			name = convertEncoding<wchar_t, char, UTF16Decode, UTF8Encode>(unescaped);
+		} else {
+			if (!std::all_of(argument.begin(), argument.end(), [](wchar_t c) { return c >= L'0' && c <= L'9'; }))
+				throw std::invalid_argument("invalid player id");
+			const auto id = std::stoull(argument);
+			if (!id || id > UINT32_MAX) throw std::invalid_argument("invalid player id");
+			const auto found = this->_playersById.find(static_cast<uint32_t>(id));
+			if (found != this->_playersById.end() && found->second) name = found->second->name;
+			if (name.empty()) {
+				std::lock_guard<std::mutex> lock(this->_recentOpponentMutex);
+				if (this->_recentOpponent && this->_recentOpponent->playerId == id)
+					name = this->_recentOpponent->playerName;
+			}
+		}
+	} catch (...) {
+		error("玩家必须使用数字 ID 或 @玩家名。", "Use a numeric player ID or @name.");
+		return true;
+	}
+	if (!ClientNames::validRatingName(name)) {
+		error("找不到该玩家或玩家名称无效。", "Player not found or invalid player name.");
+		return true;
+	}
+	if (!lobbyData) return true;
+	if (std::any_of(this->_pendingRatingQueries.begin(), this->_pendingRatingQueries.end(),
+		[&](const auto &query) { return query.name == name; })) {
+		error("正在查询该玩家，请稍候。", "This player's rating is already being queried.");
+		return true;
+	}
+	if (this->_pendingRatingQueries.size() >= 8) {
+		error("待处理的等级分查询过多，请稍后重试。", "Too many pending rating queries. Try again shortly.");
+		return true;
+	}
+	// Network queries are independent of whether the user displays rating cards.
+	auto &ratings = lobbyData->relativeRatings();
+	ratings.setEnabled(true);
+	RelativeRatings::Rating rating;
+	if (ratings.lookup(name, rating)) this->_showRatingQueryResult(name, rating);
+	else {
+		this->_pendingRatingQueries.push_back({name, std::chrono::steady_clock::now() + std::chrono::seconds(60)});
+		this->_addMessageToList(0x00FFFF, 0, (chineseLanguage ? "正在查询等级分：" : "Querying rating: ") + name);
+		this->_nextRatingQueryPoll = {};
+	}
+	return true;
+}
+
+void InLobbyMenu::_showRatingQueryResult(const std::string &name, const RelativeRatings::Rating &rating)
+{
+	auto score = [](double value) {
+		std::ostringstream text;
+		text << std::fixed << std::setprecision(0) << value;
+		return text.str();
+	};
+	std::string result = (chineseLanguage ? "[等级分] " : "[Rating] ") + name + "\n" +
+		(chineseLanguage ? "总分：" : "Overall: ") + score(rating.value) + " \xC2\xB1" + score(rating.deviation * 2.0);
+	for (size_t i = 0; i < rating.characters.size() && i < 4; ++i) {
+		const auto &character = rating.characters[i];
+		const auto label = chineseLanguage ? convertEncoding<wchar_t, char, UTF16Decode, UTF8Encode>(ratingCharacterName(character.code)) : character.code;
+		result += "\n" + label + ": " + score(character.rating);
+	}
+	this->_addMessageToList(0x00FFFF, 0, result);
+}
+
+void InLobbyMenu::_updateRatingQueries()
+{
+	if (!lobbyData || !this->_connection->isInit()) { this->_pendingRatingQueries.clear(); return; }
+	const auto now = std::chrono::steady_clock::now();
+	if (this->_pendingRatingQueries.empty() || now < this->_nextRatingQueryPoll) return;
+	this->_nextRatingQueryPoll = now + std::chrono::milliseconds(250);
+	auto &ratings = lobbyData->relativeRatings();
+	for (auto query = this->_pendingRatingQueries.begin(); query != this->_pendingRatingQueries.end();) {
+		RelativeRatings::Rating rating;
+		if (ratings.lookup(query->name, rating)) this->_showRatingQueryResult(query->name, rating);
+		else {
+			const auto status = ratings.requestStatus(query->name);
+			if (status.state == RatingRequests::State::Loading && now < query->deadline) { ++query; continue; }
+			const auto detail = status.state == RatingRequests::State::Loading ?
+				(chineseLanguage ? L"查询尚未完成，请稍后重试。" : L"Query is taking too long. Try again shortly.") :
+				RatingRequests::text(status, chineseLanguage);
+			this->_addMessageToList(status.state == RatingRequests::State::NoRecord ? 0xFFFF00 : 0xFF0000, 0,
+				(chineseLanguage ? "[等级分] " : "[Rating] ") + query->name + (chineseLanguage ? "：" : ": ") +
+				convertEncoding<wchar_t, char, UTF16Decode, UTF8Encode>(detail));
+		}
+		query = this->_pendingRatingQueries.erase(query);
+	}
+}
+
 bool InLobbyMenu::_handleLocalHelp(const std::wstring &msg)
 {
 	std::wstring command = msg;
@@ -4086,6 +4218,7 @@ bool InLobbyMenu::_handleLocalHelp(const std::wstring &msg)
 				L"/msg <玩家> <消息>\n"
 				L"/report [玩家] <原因>\n"
 				L"/tp <玩家>\n"
+				L"/rating <玩家>\n"
 				L"/block <玩家>\n"
 				L"/unblock <玩家名>\n"
 				L"/blocklist\n"
@@ -4123,6 +4256,8 @@ bool InLobbyMenu::_handleLocalHelp(const std::wstring &msg)
 				L"/report 被举报人已经离开大厅";
 		else if (_wcsicmp(argument.c_str(), L"tp") == 0)
 			helpText = L"/tp <玩家>：传送到指定玩家的位置。支持数字 ID 或准确的 @玩家名；冷却时间为60秒，在对战机、观战机或电梯内无法使用。\n示例：\n/tp 1\n/tp @PinkySmile";
+		else if (_wcsicmp(argument.c_str(), L"rating") == 0)
+			helpText = L"/rating <玩家>：查询等级分、偏差及最多四个常用角色评分。支持数字 ID 或 @玩家名，支持 Tab 和上下键联想；仅自己可见，不需要开启评分卡片。\n示例：\n/rating 1\n/rating @PinkySmile";
 		else if (_wcsicmp(argument.c_str(), L"block") == 0)
 			helpText = L"/block <玩家>：阻止该玩家以对战者身份连接你。支持数字 ID 或准确的 @玩家名。\n示例：\n/block 1\n/block @PinkySmile";
 		else if (_wcsicmp(argument.c_str(), L"blocklist") == 0)
@@ -4142,7 +4277,7 @@ bool InLobbyMenu::_handleLocalHelp(const std::wstring &msg)
 		this->_addMessageToList(
 			0xFFFF00,
 			0,
-			"Client commands:\n/tp <player>\n/block <player>\n/unblock <name>\n/blocklist\n/report [player] <reason>: The player is optional; omit it if they have left the lobby. Then send supporting evidence in QQ group 178884533 or privately message an administrator from the group.\nPlayer completion: use Tab or Up/Down after /msg, /report, /join, /tp, /block, or /unblock."
+			"Client commands:\n/tp <player>\n/rating <player>\n/block <player>\n/unblock <name>\n/blocklist\n/report [player] <reason>: The player is optional; omit it if they have left the lobby. Then send supporting evidence in QQ group 178884533 or privately message an administrator from the group.\nPlayer completion: use Tab or Up/Down after /msg, /report, /join, /tp, /rating, /block, or /unblock."
 		);
 		return false;
 	}
@@ -4156,6 +4291,10 @@ bool InLobbyMenu::_handleLocalHelp(const std::wstring &msg)
 		argument.pop_back();
 	if (!argument.empty() && argument.front() == L'/')
 		argument.erase(argument.begin());
+	if (_wcsicmp(argument.c_str(), L"rating") == 0) {
+		this->_addMessageToList(0xFFFF00, 0, "/rating <player>: Privately query overall rating, deviation and up to four character ratings. Use a numeric ID or @name; Tab and Up/Down completion is supported. Works with rating cards turned off.\nExample:\n/rating 1\n/rating @PinkySmile");
+		return true;
+	}
 	if (_wcsicmp(argument.c_str(), L"tp") != 0 && _wcsicmp(argument.c_str(), L"block") != 0 && _wcsicmp(argument.c_str(), L"blocklist") != 0 && _wcsicmp(argument.c_str(), L"unblock") != 0)
 		return false;
 
@@ -4346,6 +4485,8 @@ void InLobbyMenu::_sendMessage(const std::wstring &msg)
 		return;
 	if (this->_handleLocalTeleport(msg))
 		return;
+	if (this->_handleLocalRating(msg))
+		return;
 	std::string encoded;
 	std::wstring token;
 	std::wstring currentEmote;
@@ -4424,6 +4565,7 @@ void InLobbyMenu::_sendEmote(const LobbyData::Emote &emote)
 
 void InLobbyMenu::updateChat(bool inGame)
 {
+	this->_updateRatingQueries();
 	// Prune even while hidden, on the game thread so texture destruction is safe.
 	std::list<Message> retiredMessages;
 	{
@@ -5059,6 +5201,7 @@ bool InLobbyMenu::_getPlayerCompletionTarget(size_t &targetStart, size_t &target
 		{L"/report ", true},
 		{L"/join ", false},
 		{L"/tp ", false},
+		{L"/rating ", false},
 		{L"/block ", false},
 		{L"/unblock ", false},
 	};
@@ -5133,7 +5276,7 @@ void InLobbyMenu::_refreshPrivateMessageCompletions()
 	this->_privateMessageCompletions.clear();
 	if (commandCompletion) {
 		static constexpr const wchar_t *commands[]{
-			L"help", L"join", L"list", L"msg", L"report", L"tp", L"block", L"blocklist", L"unblock"
+			L"help", L"join", L"list", L"msg", L"report", L"tp", L"rating", L"block", L"blocklist", L"unblock"
 		};
 		for (const auto *command : commands) {
 			std::wstring name = command;
@@ -5320,7 +5463,8 @@ void InLobbyMenu::_applyPrivateMessageCompletion()
 			replacement += chr;
 		}
 	}
-	else if (currentText.compare(0, wcslen(L"/report "), L"/report ") == 0) {
+	else if (currentText.compare(0, wcslen(L"/report "), L"/report ") == 0 ||
+		(currentText.compare(0, wcslen(L"/rating "), L"/rating ") == 0 && completion.recentOpponent)) {
 		replacement = L"@";
 		for (wchar_t chr : completion.playerName) {
 			if (chr == L'\\' || iswspace(chr))

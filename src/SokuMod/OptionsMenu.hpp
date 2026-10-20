@@ -38,7 +38,7 @@ private:
 	bool _editingRatings = false;
 	unsigned _ratingPage = 0;
 	unsigned _ratingCursor = 0;
-	SokuLib::DrawUtils::Sprite _ratingDescription;
+	SokuLib::DrawUtils::Sprite _ratingDescription[2];
 	SokuLib::DrawUtils::Sprite _ratingHint;
 	std::vector<SokuLib::DrawUtils::Sprite> _ratingLabels;
 	std::vector<SokuLib::DrawUtils::Sprite> _ratingValues;

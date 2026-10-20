@@ -8,6 +8,7 @@
 #include <thread>
 #include <unordered_map>
 #include <vector>
+#include "RatingRequestStatus.hpp"
 
 class RelativeRatings {
 public:
@@ -46,6 +47,7 @@ private:
 	std::unordered_map<std::string, unsigned> _nameCounts;
 	mutable std::vector<std::string> _pendingProfiles;
 	mutable std::unordered_map<std::string, std::uint64_t> _profileChecked;
+	mutable std::unordered_map<std::string, RatingRequests::Status> _profileStatus;
 	std::unordered_map<std::string, std::string> _profileHandles;
 #ifdef SOKU_RATINGS_NETWORK_PROBE
 	bool _networkProbeDone = false; // Worker thread only.
@@ -69,4 +71,5 @@ public:
 	bool setMapping(const std::string &profile, const std::string &account);
 	bool lookup(const std::string &profile, Rating &rating) const;
 	bool hasData() const;
+	RatingRequests::Status requestStatus(const std::string &profile) const;
 };

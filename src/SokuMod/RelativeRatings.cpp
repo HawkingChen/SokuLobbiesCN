@@ -22,6 +22,21 @@
 
 namespace {
 	using Json = nlohmann::json;
+	RatingRequests::Status classifyRatingFailure(CURLcode result, long http) {
+		using RatingRequests::State;
+		switch (result) {
+		case CURLE_OK: return {http == 200 ? State::NoRecord : State::Http, http};
+		case CURLE_HTTP_RETURNED_ERROR: return {State::Http, http};
+		case CURLE_COULDNT_RESOLVE_HOST: case CURLE_COULDNT_RESOLVE_PROXY: return {State::Dns};
+		case CURLE_COULDNT_CONNECT: return {State::Connect};
+		case CURLE_OPERATION_TIMEDOUT: return {State::Timeout};
+		case CURLE_SSL_CONNECT_ERROR: return {State::Tls};
+		case CURLE_PEER_FAILED_VERIFICATION: return {State::Certificate};
+		case CURLE_SSL_CACERT_BADFILE: return {State::CaFile};
+		case CURLE_FAILED_INIT: case CURLE_OUT_OF_MEMORY: return {State::Internal};
+		default: return {State::Transfer};
+		}
+	}
 	bool caBundleExists(const std::wstring &path) {
 		std::error_code error;
 		return std::filesystem::exists(path, error);
@@ -208,6 +223,7 @@ bool RelativeRatings::lookup(const std::string &profile, Rating &rating) const
 		if ((checked == _profileChecked.end() || now < checked->second || now - checked->second > 6000000000ULL) && _pendingProfiles.size() < 1000) {
 			_profileChecked[name] = now;
 			_pendingProfiles.push_back(name);
+			_profileStatus[name] = {RatingRequests::State::Loading};
 			_wake.notify_all();
 		}
 	}
@@ -253,6 +269,16 @@ bool RelativeRatings::hasData() const
 {
 	std::lock_guard<std::mutex> lock(_mutex);
 	return !_byName.empty();
+}
+
+RatingRequests::Status RelativeRatings::requestStatus(const std::string &profile) const
+{
+	const auto name = trim(profile);
+	if (!ClientNames::validRatingName(name)) return {RatingRequests::State::InvalidName};
+	if (_workerFailed.load()) return {RatingRequests::State::Internal};
+	std::lock_guard<std::mutex> lock(_mutex);
+	const auto found = _profileStatus.find(name);
+	return found == _profileStatus.end() ? RatingRequests::Status{} : found->second;
 }
 
 void RelativeRatings::_loadMappings()
@@ -375,6 +401,7 @@ void RelativeRatings::_downloadProfiles(const std::vector<std::string> &profiles
 		if (!ClientNames::validRatingName(profile)) continue;
 		const auto path = cacheFileFor(profile);
 		const auto written = cacheTime(path);
+		bool cacheLoaded = false;
 		if (written) {
 			try {
 				std::ifstream file(path, std::ios::binary | std::ios::ate);
@@ -383,22 +410,24 @@ void RelativeRatings::_downloadProfiles(const std::vector<std::string> &profiles
 					std::string json(static_cast<std::size_t>(length), '\0');
 					file.seekg(0);
 					file.read(json.data(), static_cast<std::streamsize>(length));
-					if (file) _publish(json);
+					if (file) cacheLoaded = _publish(json);
 				}
 			} catch (...) {}
 		}
 		constexpr std::uint64_t cacheLifetime = 6000000000ULL;
-		if (!written || fileTimeNow() < written || fileTimeNow() - written >= cacheLifetime)
+		if (!cacheLoaded || !written || fileTimeNow() < written || fileTimeNow() - written >= cacheLifetime)
 			pending.push_back(profile);
 		else {
 			std::lock_guard<std::mutex> lock(_mutex);
 			_profileChecked[profile] = written;
+			_profileStatus[profile] = {RatingRequests::State::NoRecord};
 		}
 	}
 	_debugLog("profile batch requested=" + std::to_string(profiles.size()) + " cache_miss=" + std::to_string(pending.size()));
 	if (pending.empty()) return;
 
 	std::string lastFetchInfo;
+	RatingRequests::Status lastFailure{RatingRequests::State::Internal};
 	auto fetch = [&](const std::string &url, const std::string *postBody, std::string &body, const std::string &label) {
 		DownloadBuffer response{{}, &_enabled, &_stopping};
 		curl_slist *headers = nullptr;
@@ -409,6 +438,7 @@ void RelativeRatings::_downloadProfiles(const std::vector<std::string> &profiles
 		// when formatting/logging a request result throws.
 		std::unique_ptr<CURL, decltype(&curl_easy_cleanup)> request(curl_easy_init(), &curl_easy_cleanup);
 		if (!request) {
+			lastFailure = {RatingRequests::State::Internal};
 			lastFetchInfo = label + " curl init failed";
 			return false;
 		}
@@ -445,6 +475,7 @@ void RelativeRatings::_downloadProfiles(const std::vector<std::string> &profiles
 		const auto result = curl_easy_perform(curl);
 		long code = 0;
 		curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &code);
+		lastFailure = classifyRatingFailure(result, code);
 		lastFetchInfo = label + " result=" + curl_easy_strerror(result) + " http=" + std::to_string(code) +
 			" bytes=" + std::to_string(response.body.size());
 #ifdef SOKU_RATINGS_DIAGNOSTICS
@@ -492,6 +523,7 @@ void RelativeRatings::_downloadProfiles(const std::vector<std::string> &profiles
 #endif
 		if (result != CURLE_OK || code != 200) return false;
 		body = std::move(response.body);
+		if (body.empty()) lastFailure = {RatingRequests::State::InvalidResponse};
 		return !body.empty();
 	};
 	auto queryBatch = [&](const std::vector<std::string> &names, std::string &body) {
@@ -508,7 +540,10 @@ void RelativeRatings::_downloadProfiles(const std::vector<std::string> &profiles
 		_debugLog("batch request failed: " + lastFetchInfo + " ca_bundle_exists=" +
 			(caBundleExists(_caPath) ? "true" : "false"));
 		std::lock_guard<std::mutex> lock(_mutex);
-		for (const auto &name : pending) _profileChecked[name] = fileTimeNow() - 5400000000ULL;
+		for (const auto &name : pending) {
+			_profileChecked[name] = fileTimeNow() - 5400000000ULL;
+			_profileStatus[name] = lastFailure;
+		}
 		return;
 	}
 	const auto now = fileTimeNow();
@@ -516,9 +551,11 @@ void RelativeRatings::_downloadProfiles(const std::vector<std::string> &profiles
 	std::unordered_set<std::string> foundNames;
 	std::vector<std::pair<std::string, std::string>> aliases;
 	std::size_t responseRecords = 0;
+	bool validResponse = false;
 	try {
 		auto root = Json::parse(body);
 		if (root.contains("players") && root["players"].is_array()) {
+			validResponse = true;
 			responseRecords = root["players"].size();
 			for (const auto &entry : root["players"]) {
 				const auto query = optionalString(entry, "query");
@@ -528,6 +565,15 @@ void RelativeRatings::_downloadProfiles(const std::vector<std::string> &profiles
 			}
 		}
 	} catch (...) {}
+	if (!validResponse || (responseRecords && !published)) {
+		std::lock_guard<std::mutex> lock(_mutex);
+		for (const auto &name : pending) {
+			_profileStatus[name] = {RatingRequests::State::InvalidResponse};
+			_profileChecked[name] = now - 5400000000ULL;
+		}
+		return;
+	}
+	std::unordered_map<std::string, RatingRequests::Status> aliasErrors;
 	_debugLog("batch response: " + lastFetchInfo + " records=" + std::to_string(responseRecords) +
 		" published=" + (published ? "true" : "false"));
 	std::size_t aliasAttempts = 0;
@@ -535,24 +581,30 @@ void RelativeRatings::_downloadProfiles(const std::vector<std::string> &profiles
 	for (const auto &name : pending) {
 		if (foundNames.count(name)) continue;
 		std::unique_ptr<CURL, decltype(&curl_easy_cleanup)> request(curl_easy_init(), &curl_easy_cleanup);
-		if (!request) continue;
+		if (!request) { aliasErrors[name] = {RatingRequests::State::Internal}; continue; }
 		auto *curl = request.get();
 		char *encoded = curl_easy_escape(curl, name.c_str(), static_cast<int>(name.size()));
 		ClientConstructionGuard freeEncoded([&]() noexcept { curl_free(encoded); });
 		std::string mapping;
 		if (encoded) {
 			++aliasAttempts;
-			if (!fetch("https://soku.cleista.cc/api/names/profiles?name=" + std::string(encoded), nullptr, mapping, "names/profiles GET"))
+			if (!fetch("https://soku.cleista.cc/api/names/profiles?name=" + std::string(encoded), nullptr, mapping, "names/profiles GET")) {
 				++aliasFailures;
+				aliasErrors[name] = lastFailure;
+			}
 		}
+		else aliasErrors[name] = {RatingRequests::State::Internal};
 		try {
 			auto root = Json::parse(mapping);
+			if (!root.is_object()) throw std::runtime_error("Invalid alias response");
 			auto item = root.find(name);
 			if (item != root.end() && item->is_object()) {
 				auto handle = optionalString(*item, "handle");
 				if (!handle.empty()) aliases.emplace_back(name, std::move(handle));
 			}
-		} catch (...) {}
+		} catch (...) {
+			if (!aliasErrors.count(name)) aliasErrors[name] = {RatingRequests::State::InvalidResponse};
+		}
 	}
 	if (aliasFailures)
 		_debugLog("profile alias fallback failures=" + std::to_string(aliasFailures) + "/" + std::to_string(aliasAttempts) +
@@ -563,6 +615,15 @@ void RelativeRatings::_downloadProfiles(const std::vector<std::string> &profiles
 		std::string handleBody;
 		if (queryBatch(handles, handleBody)) {
 			const bool handlePublished = _publish(handleBody);
+			if (!handlePublished) {
+				try {
+					const auto parsed = Json::parse(handleBody);
+					if (!parsed.contains("players") || !parsed["players"].is_array() || !parsed["players"].empty())
+						throw std::runtime_error("Invalid handle response");
+				} catch (...) {
+					for (const auto &alias : aliases) aliasErrors[alias.first] = {RatingRequests::State::InvalidResponse};
+				}
+			}
 			_debugLog("handle batch response: " + lastFetchInfo + " published=" + (handlePublished ? "true" : "false"));
 			try {
 				auto root = Json::parse(handleBody);
@@ -583,10 +644,13 @@ void RelativeRatings::_downloadProfiles(const std::vector<std::string> &profiles
 				}
 			} catch (...) {}
 		}
+		else for (const auto &alias : aliases) aliasErrors[alias.first] = lastFailure;
 	}
 	for (const auto &name : pending) {
 		std::lock_guard<std::mutex> lock(_mutex);
 		_profileChecked[name] = foundNames.count(name) ? now : now - 5400000000ULL;
+		auto failure = aliasErrors.find(name);
+		_profileStatus[name] = failure == aliasErrors.end() ? RatingRequests::Status{RatingRequests::State::NoRecord} : failure->second;
 	}
 	_debugLog("batch complete requested=" + std::to_string(pending.size()) + " matched=" + std::to_string(foundNames.size()) +
 		" aliases=" + std::to_string(aliases.size()) + " rating_data_loaded=" + (hasData() ? "true" : "false"));
@@ -655,6 +719,10 @@ void RelativeRatings::_run()
 				_debugLog(std::string("rating batch failed; worker continues: ") + reason);
 			});
 			if (!completed) {
+				{
+					std::lock_guard<std::mutex> lock(_mutex);
+					for (const auto &profile : pendingProfiles) _profileStatus[profile] = {RatingRequests::State::Internal};
+				}
 				// Retain published data and the existing per-name query cooldown.
 				// Wait rather than spin if more incoming names keep causing errors.
 				std::unique_lock<std::mutex> lock(_mutex);

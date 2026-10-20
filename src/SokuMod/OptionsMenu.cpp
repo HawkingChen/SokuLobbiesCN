@@ -714,20 +714,28 @@ void OptionsMenu::_refreshRatingSettings()
 		: L"Arrows: Change    B / ESC: Back", 12, {540, 20});
 	this->_ratingHint.setPosition({62, 392});
 	const std::vector<std::wstring> descriptions = chineseLanguage ? std::vector<std::wstring>{
-			L"\u5728\u5927\u5385\u663E\u793A\u7B49\u7EA7\u5206\u5361\u7247\u3002\u6570\u636E\u5728\u540E\u53F0\u52A0\u8F7D\u5E76\u7F13\u5B58\u3002",
-			L"\u81EA\u52A8\u663E\u793A\u6700\u8FD1\u73A9\u5BB6\uFF1B\u6309 F8 \u4E34\u65F6\u5207\u6362\u4E0B\u4E00\u4F4D\u3002\n\u79FB\u52A8\u540E\u6062\u590D\u81EA\u52A8\u8DDF\u968F\u3002F10 \u4E34\u65F6\u9690\u85CF/\u6062\u590D\u5361\u7247\u3002",
+			L"\u5728\u5927\u5385\u663E\u793A\u7B49\u7EA7\u5206\u5361\u7247\u3002\n\u6570\u636E\u5728\u540E\u53F0\u6309\u9700\u52A0\u8F7D\u5E76\u7F13\u5B58\u3002",
+			L"\u81EA\u52A8\u8DDF\u968F\u6700\u8FD1\u73A9\u5BB6\uFF0C\u91CD\u53E0\u65F6\u6700\u591A\u4E24\u5F20\uFF1BF8 \u5207\u6362\u4EC5\u663E\u793A\u4E00\u5F20\u3002\n\u79FB\u52A8\u6062\u590D\u81EA\u52A8\uFF1BF10 \u5F00\u5173\u9644\u8FD1\u5361\u7247\u5E76\u4FDD\u5B58\u8BBE\u7F6E\u3002",
 			L"\u5728\u5DE6\u4E0A\u89D2\u663E\u793A\u81EA\u5DF1\u7684\u7B49\u7EA7\u5206\u5361\u7247\u3002",
-			L"\u7EA2\u8272\u4E0A\u7BAD\u5934\uFF1A\u9AD8\u4E8E\u4F60\uFF1B\u7EFF\u8272\u4E0B\u7BAD\u5934\uFF1A\u4F4E\u4E8E\u4F60\u3002\n\u5206\u5DEE >100 / >200 / >=300\uFF1A1 / 2 / 3 \u4E2A\u7BAD\u5934\u3002\n\u76F8\u5DEE 100 \u5206\u4EE5\u5185\uFF1A\u84DD\u8272\u7B49\u53F7\u3002",
-			L"\u8C03\u6574\u9644\u8FD1\u73A9\u5BB6\u7684\u5361\u7247\u4F4D\u7F6E\uFF0C\u9760\u8FD1\u5C4F\u5E55\u8FB9\u7F18\u65F6\u81EA\u52A8\u907F\u8BA9\u3002"
+			L"\u7EA2\u8272\u4E0A\u7BAD\u5934\uFF1A\u9AD8\u4E8E\u4F60\uFF1B\u7EFF\u8272\u4E0B\u7BAD\u5934\uFF1A\u4F4E\u4E8E\u4F60\uFF1B100 \u5206\u4EE5\u5185\uFF1A\u84DD\u8272\u7B49\u53F7\u3002\n\u5206\u5DEE >100 / >200 / >=300\uFF1A\u5206\u522B\u663E\u793A 1 / 2 / 3 \u4E2A\u7BAD\u5934\u3002",
+			L"\u8C03\u6574\u9644\u8FD1\u73A9\u5BB6\u7684\u5361\u7247\u4F4D\u7F6E\u3002\n\u9760\u8FD1\u5C4F\u5E55\u8FB9\u7F18\u65F6\u81EA\u52A8\u907F\u8BA9\u3002"
 	} : std::vector<std::wstring>{
-			L"Show rating cards. Data loads and caches in the background.",
-			L"Auto shows the nearest player. F8 temporarily cycles to the next player; moving restores auto-follow.\nF10 temporarily hides/shows the card (settings unchanged).",
+			L"Show rating cards in the lobby.\nData loads on demand and caches in the background.",
+			L"Auto: up to 2 cards for overlapping players. F8: 1 card.\nMove to resume auto. F10 toggles cards and saves the setting.",
 			L"Show your own rating card in the top-left corner.",
-			L"Red up: higher; green down: lower.\nGap >100 / >200 / >=300: 1 / 2 / 3 arrows.\nWithin 100 points: blue equals sign.",
-			L"Place nearby player cards. Cards stay inside the screen."
+			L"Red up: higher; green down: lower; within 100: blue equals.\nGap >100 / >200 / >=300: 1 / 2 / 3 arrows.",
+			L"Adjust the position of nearby player cards.\nCards stay inside the screen."
 	};
-	createLocalizedSprite(this->_ratingDescription, descriptions[this->_ratingCursor], 12, {518, 52});
-	this->_ratingDescription.setPosition({62, 318});
+	const auto &description = descriptions[this->_ratingCursor];
+	const auto split = description.find(L'\n');
+	const std::wstring lines[2] = {description.substr(0, split), split == std::wstring::npos ? L"" : description.substr(split + 1)};
+	// Separate single-line textures avoid relying on the text renderer's newline handling.
+	for (unsigned i = 0; i < 2; ++i) {
+		this->_ratingDescription[i].texture.destroy();
+		if (lines[i].empty()) continue;
+		createLocalizedSprite(this->_ratingDescription[i], lines[i], 12, {518, 22});
+		this->_ratingDescription[i].setPosition({62, 318 + static_cast<int>(i) * 20});
+	}
 	std::vector<std::wstring> names;
 	std::vector<std::wstring> values;
 	if (this->_ratingPage == 0) {
@@ -817,9 +825,12 @@ void OptionsMenu::_renderRatingSettings()
 	selection.setFillColor(SokuLib::Color{101, 162, 197, 128});
 	selection.setBorderColor(SokuLib::Color{101, 162, 197, 0});
 	selection.draw();
-	this->_ratingDescription.tint = SokuLib::Color{171, 195, 212, 255};
 	this->_ratingHint.tint = SokuLib::Color{171, 195, 212, 255};
-	this->_ratingDescription.draw();
+	for (auto &line : this->_ratingDescription) {
+		if (!line.texture.hasTexture()) continue;
+		line.tint = SokuLib::Color{171, 195, 212, 255};
+		line.draw();
+	}
 	constexpr unsigned rows = 5;
 	for (unsigned i = 0; i < rows; ++i) {
 		int y = 105 + static_cast<int>(i) * 31;

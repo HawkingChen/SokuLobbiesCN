@@ -176,6 +176,12 @@ private:
 	};
 	std::map<uint32_t, PlayerData> _extraPlayerData;
 	std::map<uint32_t, RelativeRatingCard> _relativeRatingCards;
+	struct PendingRatingQuery {
+		std::string name;
+		std::chrono::steady_clock::time_point deadline;
+	};
+	std::vector<PendingRatingQuery> _pendingRatingQueries;
+	std::chrono::steady_clock::time_point _nextRatingQueryPoll{};
 	uint32_t _relativeRatingTarget = UINT32_MAX;
 	uint32_t _relativeRatingCandidate = UINT32_MAX;
 	std::chrono::steady_clock::time_point _relativeRatingCandidateSince{};
@@ -184,7 +190,6 @@ private:
 	SokuLib::Vector2u _relativeRatingLastPosition{};
 	bool _relativeRatingF8WasDown = false;
 	bool _relativeRatingF10WasDown = false;
-	int _relativeRatingHotkeyMode = -1;
 	unsigned _relativeRatingLastConfiguredMode = UINT32_MAX;
 	std::map<uint32_t, std::string> _pendingPlayerNames;
 	std::queue<uint32_t> _pendingPlayerNameOrder;
@@ -342,6 +347,9 @@ private:
 	void _renderPrivateMessageCompletions();
 	void _updateTextCursor(int pos);
 	bool _handleLocalTeleport(const std::wstring &msg);
+	bool _handleLocalRating(const std::wstring &msg);
+	void _updateRatingQueries();
+	void _showRatingQueryResult(const std::string &name, const RelativeRatings::Rating &rating);
 	bool _handleLocalBlock(const std::wstring &msg);
 	bool _handleLocalHelp(const std::wstring &msg);
 	void _sendMessage(const std::wstring &msg);

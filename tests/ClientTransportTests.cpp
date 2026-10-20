@@ -1,5 +1,8 @@
 #include "ClientTransport.hpp"
 #include "ClientChatLog.hpp"
+#include "IdleTracking.hpp"
+#include "RatingRequestStatus.hpp"
+#include "NearbyRatingCards.hpp"
 #include "Socket.hpp"
 #include "HttpResponseBuffer.hpp"
 #include "Utf8Name.hpp"
@@ -17,6 +20,95 @@
 #endif
 
 static void require(bool condition, const char *message) { if (!condition) throw std::runtime_error(message); }
+
+static void nearbyRatingCardStacking()
+{
+	struct Point { uint32_t x, y; };
+	struct Player { uint32_t id; Point pos; };
+	const std::vector<Player> crowd{{1, {100, 100}}, {2, {110, 100}}, {4, {112, 100}}, {3, {112, 100}}, {5, {115, 100}}};
+	using namespace NearbyRatingCards;
+	require(secondTarget(crowd, 1, 100, 100, 2, false) == 3, "overlapping crowd did not pick one stable second player");
+	require(secondTarget(crowd, 1, 100, 100, 2, true) == NO_TARGET, "F8 manual target gained a second card");
+	require(secondTarget(crowd, 1, 100, 100, 99, false) == NO_TARGET, "departed primary retained a second card");
+	const std::vector<Player> separate{{1, {110, 100}}, {2, {110, 100}}, {3, {180, 100}}, {4, {110, 180}}};
+	require(secondTarget(separate, 1, 110, 100, 2, false) == NO_TARGET, "separate players or self triggered a stack");
+	const std::vector<Player> distant{{2, {449, 0}}, {3, {451, 0}}};
+	require(secondTarget(distant, 1, 0, 0, 2, false) == NO_TARGET, "out-of-range secondary triggered a stack");
+	const std::vector<Player> huge{{2, {110, 100}}, {3, {UINT32_MAX, UINT32_MAX}}};
+	require(secondTarget(huge, 1, 100, 100, 2, false) == NO_TARGET, "coordinate overflow created false overlap");
+	for (unsigned mode = 0; mode < 3; ++mode)
+		for (int x : {-200, 0, 320, 640, 900})
+			for (int y : {-200, 0, 240, 480, 900})
+				for (int offset : {-300, 0, 300}) {
+					const auto layout = stackPosition({140, 102}, {230, 52}, x, y, mode, offset, offset);
+					require(layout.x >= 4 && layout.x + 230 <= 636, "card stack clipped horizontally");
+					require(layout.y >= 4 && layout.secondY + 52 <= 476, "card stack clipped vertically");
+					require(layout.secondY >= layout.y + 102 + 6, "second card overlapped the first");
+				}
+	std::cout << "PASS automatic two-card overlap selection, F8 single-card override and screen-edge layout\n";
+}
+
+static void ratingRequestFailures()
+{
+	using RatingRequests::State;
+	std::vector<std::wstring> chinese, english;
+	for (auto state : {State::Loading, State::NoRecord, State::Dns, State::Connect, State::Timeout,
+		State::Tls, State::Certificate, State::CaFile, State::Transfer, State::InvalidResponse, State::Internal, State::InvalidName}) {
+		const RatingRequests::Status status{state};
+		require(!RatingRequests::text(status, true).empty() && !RatingRequests::text(status, false).empty(),
+			"rating error missing translation");
+		for (auto previous : chinese) require(previous != RatingRequests::text(status, true), "different failures share Chinese text");
+		for (auto previous : english) require(previous != RatingRequests::text(status, false), "different failures share English text");
+		chinese.push_back(RatingRequests::text(status, true));
+		english.push_back(RatingRequests::text(status, false));
+	}
+	for (long http : {403L, 429L, 500L, 503L}) {
+		const RatingRequests::Status status{State::Http, http};
+		require(RatingRequests::text(status, false).find(std::to_wstring(http)) != std::wstring::npos,
+			"HTTP status missing from card text");
+	}
+	require(RatingRequests::text({State::Loading}, false) != RatingRequests::text({State::NoRecord}, false) &&
+		RatingRequests::text({State::InvalidResponse}, true) != RatingRequests::text({State::NoRecord}, true),
+		"loading, malformed response and missing record conflated");
+	std::cout << "PASS rating DNS/connect/timeout/TLS/CA/HTTP failures and bilingual card messages\n";
+}
+
+static void idleReportingClock()
+{
+	using namespace std::chrono_literals;
+	const auto start = IdleTracking::Clock::time_point{} + 1h;
+	IdleTracking::LocalClock local;
+	local.reset(start);
+	require(!local.due(start + 1h), "old server enabled unnegotiated reports");
+	local.supported = true;
+	require(local.due(start), "capability did not trigger first report");
+	local.lastReport = start; local.dirty = false;
+	require(!local.due(start + 9s) && local.due(start + 10s), "report interval changed");
+	local.setExempt(true, start + 5s);
+	require(local.idle(start + 1h) == 0s && local.due(start + 5s), "waiting/playing failed to clear idle");
+	local.setExempt(false, start + 2h);
+	require(local.idle(start + 2h + 15s) == 15s, "leaving exemption inherited idle");
+	local.active(start + 2h + 10s);
+	require(local.idle(start + 2h + 15s) == 5s, "chat failed to reset local clock");
+	local.reset(start + 3h);
+	require(!local.supported && local.idle(start + 3h) == 0s, "rejoin inherited negotiated state");
+
+	IdleTracking::RemoteClock remote;
+	remote.accept(200, false, start);
+	require(remote.fresh(start + 29s) && !remote.fresh(start + 30s), "report freshness boundary wrong");
+	require(remote.idle(start + 10s, start - 1h) == 210s, "server did not extrapolate client duration");
+	require(remote.idle(start + 10s, start + 5s) == 5s, "autokick restart did not cap old duration");
+	remote.accept(0, true, start);
+	require(remote.idle(start + 29s, start - 1h) == 0s, "exemption accumulated idle");
+	remote.reset(); require(!remote.fresh(start), "session inherited remote report");
+	uint64_t seconds = 0;
+	require(IdleTracking::parseSeconds("1200", seconds) && seconds == 1200, "valid report rejected");
+	for (const auto *invalid : {"", "-1", "1x", "999999999999", "31536001"})
+		require(!IdleTracking::parseSeconds(invalid, seconds), "invalid duration accepted");
+	require(IdleTracking::isControl("/__idle 0 1") && IdleTracking::isControl("/__idlecap") &&
+		!IdleTracking::isControl("/msg 1 __idlecap") && !IdleTracking::isControl("/__idleother"), "control classification wrong");
+	std::cout << "PASS negotiated idle reporting, reset, lease and fallback clocks\n";
+}
 
 static void ratingUtf8CrashRegression() {
 	// The exact 66-byte name from the eight 0.7.6.2 crash dumps. The old server
@@ -284,7 +376,7 @@ int main() {
 		require(clientPacketSize(Lobbies::OPCODE_OLLEH) == sizeof(Lobbies::PacketOlleh) &&
 			clientPacketSize(Lobbies::OPCODE_MESSAGE) == sizeof(Lobbies::PacketMessage) && clientPacketSize(255) == 0,
 			"legacy frame sizes changed");
-		ratingUtf8CrashRegression(); cancellationAndLatestTaskSafety(); httpCallbackSafety(); workerExceptionSafety(); constructionAndMembershipSafety(); callbackAndCleanupSafety();
+		nearbyRatingCardStacking(); ratingRequestFailures(); idleReportingClock(); ratingUtf8CrashRegression(); cancellationAndLatestTaskSafety(); httpCallbackSafety(); workerExceptionSafety(); constructionAndMembershipSafety(); callbackAndCleanupSafety();
 		inboxBoundsAndOwnership(); nonblockingConnect(); chatLogFile();
 		return 0;
 	} catch (const std::exception &error) { std::cerr << "FAIL " << error.what() << '\n'; return 1; }
