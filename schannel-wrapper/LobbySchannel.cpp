@@ -160,7 +160,7 @@ extern "C" __declspec(dllexport) bool Initialize(HMODULE, HMODULE parent) noexce
         return f && f(baseModule, parent);
     } catch (...) { return false; }
 }
-extern "C" __declspec(dllexport) int getPriority() { return 0; }
+extern "C" __declspec(dllexport) int getPriority() { return -50000; }
 extern "C" __declspec(dllexport) int TestTransport(const wchar_t *path) {
     if (!prepare(path, true)) { std::puts("prepare failed"); return 10; }
     auto base = reinterpret_cast<unsigned char *>(baseModule);
