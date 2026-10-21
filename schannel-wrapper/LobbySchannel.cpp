@@ -122,15 +122,19 @@ bool prepare(const wchar_t *path, bool test) {
         if (!VirtualProtect(base + hooks[ready].rva, 5, PAGE_EXECUTE_READWRITE, &protect[ready])) break;
     }
     if (ready != 5) {
-        for (size_t i = 0; i < ready; ++i) { DWORD ignored; VirtualProtect(base + hooks[i].rva, 5, protect[i], &ignored); }
+        for (size_t i = ready; i-- > 0;) { DWORD ignored; VirtualProtect(base + hooks[i].rva, 5, protect[i], &ignored); }
         FreeLibrary(loaded); return false;
     }
     for (size_t i = 0; i < 5; ++i) {
         auto target = base + hooks[i].rva;
         auto delta = static_cast<std::uint32_t>(reinterpret_cast<std::uintptr_t>(hooks[i].replacement) - reinterpret_cast<std::uintptr_t>(target + 5));
         target[0] = 0xe9; std::memcpy(target + 1, &delta, 4);
-        DWORD ignored; VirtualProtect(target, 5, protect[i], &ignored);
         FlushInstructionCache(GetCurrentProcess(), target, 5);
+    }
+    // Several API entries share one page. Keep all pages writable until every
+    // jump is installed, then unwind protections in reverse acquisition order.
+    for (size_t i = 5; i-- > 0;) {
+        DWORD ignored; VirtualProtect(base + hooks[i].rva, 5, protect[i], &ignored);
     }
     baseModule = loaded;
     log("Verified official 0.7.6.3 loaded unchanged; five libcurl API entries redirected in memory; protocol preserved");
