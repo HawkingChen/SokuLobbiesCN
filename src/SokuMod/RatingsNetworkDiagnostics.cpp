@@ -137,7 +137,7 @@ void probeRatingsNetwork(const std::string &url, const std::string *postBody, co
 		curl_easy_setopt(curl, CURLOPT_SSLVERSION, static_cast<long>(CURL_SSLVERSION_TLSv1_2 | CURL_SSLVERSION_MAX_TLSv1_2));
 		curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
 		curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 2L);
-		curl_easy_setopt(curl, CURLOPT_CAINFO, caPath.c_str());
+		curl_easy_setopt(curl, CURLOPT_CAINFO, nullptr);
 		curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 5L);
 		curl_easy_setopt(curl, CURLOPT_TIMEOUT, 10L);
 		curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
@@ -154,7 +154,7 @@ void probeRatingsNetwork(const std::string &url, const std::string *postBody, co
 			curl_easy_setopt(curl, CURLOPT_POSTFIELDS, postBody->c_str());
 			curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, static_cast<long>(postBody->size()));
 		}
-		log(std::string("probe start backend=mbedTLS direct=true TLS=1.2 family=") + (family == CURL_IPRESOLVE_V4 ? "IPv4" : "IPv6"));
+		log(std::string("probe start backend=Schannel direct=true TLS=1.2 family=") + (family == CURL_IPRESOLVE_V4 ? "IPv4" : "IPv6"));
 		const auto result = curl_easy_perform(curl);
 		long http = 0;
 		char *ip = nullptr;
@@ -164,7 +164,7 @@ void probeRatingsNetwork(const std::string &url, const std::string *postBody, co
 		curl_easy_getinfo(curl, CURLINFO_TOTAL_TIME, &total);
 		curl_easy_getinfo(curl, CURLINFO_CONNECT_TIME, &tcp);
 		curl_easy_getinfo(curl, CURLINFO_APPCONNECT_TIME, &tls);
-		log(std::string("probe end backend=mbedTLS family=") + (family == CURL_IPRESOLVE_V4 ? "IPv4" : "IPv6") +
+		log(std::string("probe end backend=Schannel family=") + (family == CURL_IPRESOLVE_V4 ? "IPv4" : "IPv6") +
 			" remote=[" + (ip ? ip : "unknown") + "] curl_code=" + std::to_string(result) + " http=" + std::to_string(http) +
 			" bytes=" + std::to_string(ctx.body.size()) + " cumulative_ms[tcp,tls,total]=" +
 			std::to_string(tcp * 1000) + "," + std::to_string(tls * 1000) + "," + std::to_string(total * 1000) + " detail=" + error);
@@ -176,6 +176,6 @@ void probeRatingsNetwork(const std::string &url, const std::string *postBody, co
 		probeWindows(path, postBody, WINHTTP_ACCESS_TYPE_NO_PROXY, "direct", enabled, stopping, log);
 	if (enabled.load() && !stopping.load())
 		probeWindows(path, postBody, WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY, "Windows-auto-proxy", enabled, stopping, log);
-	log("network comparison END; normal rating queries still use original libcurl/mbedTLS path");
+	log("network comparison END; normal rating queries still use libcurl/Schannel path");
 }
 #endif

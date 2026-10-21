@@ -1,0 +1,44 @@
+name: Schannel test build
+on:
+  workflow_dispatch:
+  push:
+    branches: [schannel-test]
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: windows-2022
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - name: Fetch client dependencies
+        run: git submodule update --init src/SokuMod/SokuLib src/SokuMod/curl
+      - name: Configure x86 Schannel build
+        run: >-
+          cmake -S . -B build-schannel -A Win32
+          -DCMAKE_POLICY_VERSION_MINIMUM=3.5
+          -DCURL_USE_SCHANNEL=ON -DCURL_USE_MBEDTLS=OFF -DCURL_USE_OPENSSL=OFF
+          -DSOKU_RATINGS_DIAGNOSTICS=ON -DSOKU_RATINGS_NETWORK_PROBE=OFF
+          -DSOKULOBBIES_BUILD_TESTS=ON
+      - name: Compile DLL and TLS smoke test
+        run: cmake --build build-schannel --config Release --target SokuLobbiesMod SokuLobbiesIniConfigTests SchannelSmoke --parallel 4
+      - name: Run configuration regression
+        run: ctest --test-dir build-schannel -C Release --output-on-failure -R SokuLobbiesIniConfigTests
+      - name: Check TLS backend and make live HTTPS requests
+        run: build-schannel/Release/SchannelSmoke.exe
+      - name: Prepare test files
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force artifact | Out-Null
+          Copy-Item build-schannel/Release/SokuLobbiesMod.dll artifact/
+          Copy-Item build-schannel/Release/SchannelSmoke.exe artifact/
+          Copy-Item SCHANNEL-TEST.md artifact/
+          Copy-Item LICENSE artifact/
+          git rev-parse HEAD | Set-Content artifact/source-commit.txt
+          Get-FileHash artifact/SokuLobbiesMod.dll -Algorithm SHA256 | Format-List | Out-File artifact/SHA256.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: SokuLobbiesCN-Schannel-test
+          path: artifact/
+          if-no-files-found: error
+          retention-days: 14

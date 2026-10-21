@@ -458,7 +458,8 @@ void RelativeRatings::_downloadProfiles(const std::vector<std::string> &profiles
 		curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L);
 		curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
 		curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 2L);
-		curl_easy_setopt(curl, CURLOPT_CAINFO, caPath.c_str());
+		// Schannel uses the Windows trust store, including system-managed roots.
+		curl_easy_setopt(curl, CURLOPT_CAINFO, nullptr);
 		curl_easy_setopt(curl, CURLOPT_USERAGENT, "SokuLobbies-RelativeRatings/1.0");
 		curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, receiveBody);
 		curl_easy_setopt(curl, CURLOPT_WRITEDATA, &response);
@@ -471,7 +472,7 @@ void RelativeRatings::_downloadProfiles(const std::vector<std::string> &profiles
 			curl_easy_setopt(curl, CURLOPT_POSTFIELDS, postBody->c_str());
 			curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, static_cast<long>(postBody->size()));
 		}
-		_debugLog("request start: " + label + " backend=mbedTLS route=default verify_peer=true verify_host=true connect_timeout=6s timeout=15s");
+		_debugLog("request start: " + label + " backend=Schannel trust=Windows route=default verify_peer=true verify_host=true connect_timeout=6s timeout=15s");
 		const auto result = curl_easy_perform(curl);
 		long code = 0;
 		curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &code);
@@ -537,8 +538,7 @@ void RelativeRatings::_downloadProfiles(const std::vector<std::string> &profiles
 
 	std::string body;
 	if (!queryBatch(pending, body)) {
-		_debugLog("batch request failed: " + lastFetchInfo + " ca_bundle_exists=" +
-			(caBundleExists(_caPath) ? "true" : "false"));
+		_debugLog("batch request failed: " + lastFetchInfo + " trust=Windows");
 		std::lock_guard<std::mutex> lock(_mutex);
 		for (const auto &name : pending) {
 			_profileChecked[name] = fileTimeNow() - 5400000000ULL;
