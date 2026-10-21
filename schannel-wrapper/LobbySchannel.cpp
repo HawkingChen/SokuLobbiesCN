@@ -162,6 +162,7 @@ extern "C" __declspec(dllexport) bool Initialize(HMODULE, HMODULE parent) noexce
 }
 extern "C" __declspec(dllexport) int getPriority() { return -50000; }
 extern "C" __declspec(dllexport) int TestTransport(const wchar_t *path) {
+    std::fprintf(stderr, "prepare original DLL\n");
     if (!prepare(path, true)) { std::puts("prepare failed"); return 10; }
     auto base = reinterpret_cast<unsigned char *>(baseModule);
     auto init = reinterpret_cast<CURL *(__cdecl *)()>(base + 0x17a9e0);
@@ -169,9 +170,10 @@ extern "C" __declspec(dllexport) int TestTransport(const wchar_t *path) {
     auto run = reinterpret_cast<CURLcode (__cdecl *)(CURL *)>(base + 0x17aa40);
     auto get = reinterpret_cast<CURLcode (__cdecl *)(CURL *, CURLINFO, ...)>(base + 0x17a9c0);
     auto clean = reinterpret_cast<void (__cdecl *)(CURL *)>(base + 0x17a9a0);
-    std::printf("%s\n", curl_version());
+    std::fprintf(stderr, "%s\n", curl_version());
     int failed = 0;
     for (bool post : {false, true}) {
+        std::fprintf(stderr, "create request post=%d\n", int(post));
         CURL *easy = init(); if (!easy) return 11;
         set(easy, CURLOPT_URL, post ? "https://soku.cleista.cc/api/v1/ratings/players" : "https://soku.cleista.cc/api/v1/ratings/export.json");
         set(easy, CURLOPT_CAINFO, "Z:/deliberately-nonexistent-ca-bundle.crt");
@@ -186,6 +188,7 @@ extern "C" __declspec(dllexport) int TestTransport(const wchar_t *path) {
             set(easy, CURLOPT_POSTFIELDS, "{\"names\":[\"mian\"]}");
             set(easy, CURLOPT_POSTFIELDSIZE_LARGE, curl_off_t(18));
         }
+        std::fprintf(stderr, "perform request\n");
         auto result = run(easy); long status = 0; get(easy, CURLINFO_RESPONSE_CODE, &status);
         std::printf("official API detour %s curl=%d HTTP=%ld detail=%s\n", post ? "POST" : "GET", int(result), status, error);
         if (result || status != 200) failed = 1;

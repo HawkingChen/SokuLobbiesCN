@@ -31,7 +31,7 @@ jobs:
         run: |
           Push-Location build-wrapper/Release
           ./LobbySchannelTest.exe "$pwd/SokuLobbiesMod.dll"
-          if ($LASTEXITCODE -ne 0) { throw 'Original API network test failed' }
+          if ($LASTEXITCODE -ne 0) { Get-Content Schannel-transport.log -ErrorAction SilentlyContinue; throw "Original API network test failed: $LASTEXITCODE" }
           Pop-Location
       - name: Reject an unverified DLL
         shell: pwsh
@@ -62,3 +62,12 @@ jobs:
           path: artifact/
           if-no-files-found: error
           retention-days: 14
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: Schannel-debug
+          path: |
+            build-wrapper/Release/*.dll
+            build-wrapper/Release/*.exe
+            build-wrapper/Release/*.log
+          retention-days: 3
